@@ -176,8 +176,7 @@ CPU-only test binary; adjust for Metal by linking `../hy3_metal.o` + the
 
 This codebase had several serious correctness bugs when this round of work
 started (symptom: greedy-decoded `11+22+33=?` did not return `66`). All are
-fixed in this directory; `/root/hy3-src` still has the pre-fix versions for
-reference/diffing.
+fixed.
 
 1. **RoPE used the wrong rotation pairing.** `rope()` (hy3.c) and
    `rope_kernel` (hy3_gpu.cu) rotated adjacent dimension pairs `(d, d+1)`
