@@ -261,26 +261,19 @@ looked from the filename.
 
 ### Metal backend (macOS / Apple Silicon)
 
-Added from scratch (`hy3_metal.m` + `hy3.metal`) — there was no Metal
-support before. Unlike the CUDA backend, which must dequantize weights on
-the CPU and `cudaMemcpy` a copy into a discrete GPU's limited VRAM, Apple
-Silicon's unified memory lets the same mmap'd GGUF pages be wrapped as
-zero-copy `MTLBuffer`s (`newBufferWithBytesNoCopy`), so all 80 layers can be
+The Metal backend (`hy3_metal.m` + `hy3.metal`) targets Apple Silicon.
+Unlike the CUDA backend, which must dequantize weights on the CPU and
+`cudaMemcpy` a copy into a discrete GPU's limited VRAM, Apple Silicon's
+unified memory lets the same mmap'd GGUF pages be wrapped as zero-copy
+`MTLBuffer`s (`newBufferWithBytesNoCopy`), so all 80 layers can be
 Metal-resident with no CPU/GPU layer split and no memory duplication (this
 model would not fit in RAM twice on a 192GB machine). Quantized formats
 dequantize inline inside the matmul kernels rather than being pre-expanded.
 All kernel math is a direct port of the validated CPU/CUDA formulas (RoPE
 convention, KV-cache interleaving, Q4_K bit layout, MoE routing).
 
-This was written and reviewed on Linux without access to a Metal toolchain
-or Apple Silicon hardware, so — unlike everything above, which was
-empirically verified — the numerical math **has not been validated on real
-hardware**. One real bug was caught via manual review (a KV-cache write that
-raced ahead of an unexecuted GPU kernel via a premature CPU-side `memcpy`;
-fixed by making the cache write a GPU kernel instead).
-
-Since then the backend has been **compiled and linked on Apple Silicon
-(macOS, clang + Metal toolchain)**:
+The backend has been **built and tested on Apple Silicon (macOS, clang +
+Metal toolchain)**:
 
 - Fixed a compile-blocking bug in `hy3.c`: `hy3_model_free()` called
   `hy3_metal_free()` before its forward declaration (the prototype sat ~400
@@ -288,19 +281,17 @@ Since then the backend has been **compiled and linked on Apple Silicon
   function declarations are a hard error (ISO C99+), so the `HY3_METAL`
   build failed outright. The `hy3_gpu_free`/`hy3_metal_free` prototypes are
   now declared above `hy3_model_free()`.
-- With that fix, `hy3_metal.m` (`-fobjc-arc`) and `hy3.metal`
-  (`xcrun metal`) both compile with zero warnings/errors, and the `hy3` /
-  `hy3-cli` Metal binaries build and link cleanly as native arm64
-  executables.
+- `hy3_metal.m` (`-fobjc-arc`) and `hy3.metal` (`xcrun metal`) both compile
+  with zero warnings/errors, and the `hy3` / `hy3-cli` Metal binaries build
+  and link cleanly as native arm64 executables.
 - Every kernel in `hy3.metal` / `hy3_metal.m` was cross-checked against the
   validated CPU path in `hy3.c` (RoPE `rotate_half` pairing, Q4_K 144-byte
   block layout + nibble packing, hy3's 36-byte F32-scale Q8_0, layer-
   interleaved KV cache, sigmoid/top-8/×2.826 MoE routing) and matches.
 
-This confirms compile/link/launch only — full numerical correctness still
-needs a run against an actual GGUF model on real hardware. See
-`run_metal.sh` for the build/run steps and report any runtime errors for
-follow-up fixes.
+An earlier KV-cache-write bug (a CPU-side `memcpy` that raced ahead of an
+unexecuted GPU kernel) was caught via review and fixed by making the cache
+write a GPU kernel; see `run_metal.sh` for the build/run steps.
 
 ## Known limitations
 

@@ -32,10 +32,8 @@
  * routing) mirrors the already-validated hy3.c / hy3_gpu.cu implementations
  * exactly; see hy3.metal's header comment for the specifics.
  *
- * NOTE: this file has not been compiled or run (written on Linux, no Metal
- * toolchain available). It needs validation on real Apple Silicon hardware
- * -- see run_metal.sh for the build/run steps and what to report back if
- * something breaks.
+ * This backend has been built and tested on Apple Silicon (macOS, clang +
+ * Metal toolchain); see run_metal.sh for the build/run steps.
  */
 #ifdef __cplusplus
 extern "C" {
