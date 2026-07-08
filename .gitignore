@@ -1,0 +1,23 @@
+# Build artifacts
+*.o
+*.air
+*.metallib
+
+# Binaries
+/hy3
+/hy3-cli
+/hy3-convert
+/hy3_convert
+
+# Test binaries
+tests/hy3_test
+tests/hy3_eval
+tests/hy3_eval_fast
+tests/hy3_eval_gpu
+tests/hy3_quick_check
+
+# Models
+*.gguf
+
+# HuggingFace model repo clone
+/hy3-gguf/
