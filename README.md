@@ -7,6 +7,15 @@ Mixture-of-Experts model released by **Tencent's Hunyuan ("Hy") team**
 
 The project is called **hy3**.
 
+> **⚠️ Testing scope:** All recent performance work (single-command-buffer
+> forward, concurrent encoder, GPU-resident MoE routing, fused per-head RMS
+> norm, SIMD-group matmul kernels, `MTLResidencySet` warm-up) and all benchmark
+> numbers were developed and verified **only on macOS / Apple Silicon (the Metal
+> backend)** — measured on an M2 Ultra. The runtime top-k experts parameter
+> (`-experts` / `HY3_TOP_K_EXPERTS`) was also wired into the CPU (`hy3.c`) and
+> CUDA (`hy3_gpu.cu`) backends for consistency, but those two paths were **not
+> compiled or run** as part of this work — treat CPU/CUDA as untested here.
+
 ## Model facts
 
 | | |
