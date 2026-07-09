@@ -78,6 +78,31 @@ kernel void rms_norm_offset(device float       *buf   [[buffer(0)]],
     for (uint i = tid; i < n; i += tgSz) x[i] = x[i] * r * w[i];
 }
 
+// Fused per-head RMS norm: one threadgroup per head normalizes head_dim
+// contiguous elements with the shared weight `w`. Replaces n_heads separate
+// rms_norm_offset dispatches (was 72 tiny dispatches/layer). grid.x = n_heads.
+kernel void rms_norm_heads(device float       *buf [[buffer(0)]],
+                           device const float *w   [[buffer(1)]],
+                           constant uint      &head_dim [[buffer(2)]],
+                           uint head [[threadgroup_position_in_grid]],
+                           uint tid  [[thread_index_in_threadgroup]],
+                           uint tgSz [[threads_per_threadgroup]])
+{
+    threadgroup float sdata[256];
+    device float *x = buf + (size_t)head * head_dim;
+    float sum = 0.0f;
+    for (uint i = tid; i < head_dim; i += tgSz) sum += x[i] * x[i];
+    sdata[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgSz / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float r = rsqrt(sdata[0] / float(head_dim) + HY3_RMS_EPS_C);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < head_dim; i += tgSz) x[i] = x[i] * r * w[i];
+}
+
 /* All of the small elementwise kernels below take an explicit element
  * count `n` and bounds-check, even though every current call site happens
  * to dispatch an exact multiple of the threadgroup size (so the check
@@ -309,7 +334,9 @@ kernel void attention(device float       *out      [[buffer(0)]],
 
 // ---------------------------------------------------------------------
 // Dense matmul kernels: dst[row] = dot(W[row,:], x). One threadgroup per
-// output row, parallel tree reduction across the input dimension.
+// output row. Vectorized loads (float4/half4) + SIMD-group reduction
+// (simd_sum) instead of a full threadgroup barrier tree -- fewer barriers,
+// coalesced memory. Threadgroup = 256 threads = 8 SIMD groups of 32.
 // ---------------------------------------------------------------------
 
 kernel void matmul_f32(device float       *dst [[buffer(0)]],
@@ -318,19 +345,27 @@ kernel void matmul_f32(device float       *dst [[buffer(0)]],
                         constant uint      &n   [[buffer(3)]],
                         uint row  [[threadgroup_position_in_grid]],
                         uint tid  [[thread_index_in_threadgroup]],
-                        uint tgSz [[threads_per_threadgroup]])
+                        uint tgSz [[threads_per_threadgroup]],
+                        uint simd_lane [[thread_index_in_simdgroup]],
+                        uint simd_grp  [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float partial[256];
-    device const float *wr = w + (size_t)row * n;
+    threadgroup float partial[8];
+    device const float4 *wr = (device const float4 *)(w + (size_t)row * n);
+    device const float4 *xv = (device const float4 *)x;
+    uint n4 = n / 4;
     float sum = 0.0f;
-    for (uint j = tid; j < n; j += tgSz) sum += wr[j] * x[j];
-    partial[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgSz / 2; s > 0; s >>= 1) {
-        if (tid < s) partial[tid] += partial[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = tid; j < n4; j += tgSz) {
+        float4 a = wr[j], b = xv[j];
+        sum += a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
     }
-    if (tid == 0) dst[row] = partial[0];
+    sum = simd_sum(sum);
+    if (simd_lane == 0) partial[simd_grp] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (uint i = 0; i < tgSz / 32; i++) t += partial[i];
+        dst[row] = t;
+    }
 }
 
 kernel void matmul_f16(device float      *dst [[buffer(0)]],
@@ -339,19 +374,27 @@ kernel void matmul_f16(device float      *dst [[buffer(0)]],
                         constant uint     &n   [[buffer(3)]],
                         uint row  [[threadgroup_position_in_grid]],
                         uint tid  [[thread_index_in_threadgroup]],
-                        uint tgSz [[threads_per_threadgroup]])
+                        uint tgSz [[threads_per_threadgroup]],
+                        uint simd_lane [[thread_index_in_simdgroup]],
+                        uint simd_grp  [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float partial[256];
-    device const half *wr = w + (size_t)row * n;
+    threadgroup float partial[8];
+    device const half4  *wr = (device const half4 *)(w + (size_t)row * n);
+    device const float4 *xv = (device const float4 *)x;
+    uint n4 = n / 4;
     float sum = 0.0f;
-    for (uint j = tid; j < n; j += tgSz) sum += float(wr[j]) * x[j];
-    partial[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgSz / 2; s > 0; s >>= 1) {
-        if (tid < s) partial[tid] += partial[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = tid; j < n4; j += tgSz) {
+        float4 a = float4(wr[j]), b = xv[j];
+        sum += a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
     }
-    if (tid == 0) dst[row] = partial[0];
+    sum = simd_sum(sum);
+    if (simd_lane == 0) partial[simd_grp] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (uint i = 0; i < tgSz / 32; i++) t += partial[i];
+        dst[row] = t;
+    }
 }
 
 // Q8_0 block: 4-byte float scale + 32 signed int8 values = 36 bytes/32
@@ -363,31 +406,98 @@ kernel void matmul_q8_0(device float       *dst [[buffer(0)]],
                          constant uint      &n   [[buffer(3)]],
                          uint row  [[threadgroup_position_in_grid]],
                          uint tid  [[thread_index_in_threadgroup]],
-                         uint tgSz [[threads_per_threadgroup]])
+                         uint tgSz [[threads_per_threadgroup]],
+                         uint simd_lane [[thread_index_in_simdgroup]],
+                         uint simd_grp  [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float partial[256];
+    threadgroup float partial[8];
     uint nb = n / 32;
     device const uchar *wr = w + (size_t)row * nb * 36;
     float sum = 0.0f;
     for (uint j = tid; j < nb; j += tgSz) {
         device const uchar *blk = wr + (size_t)j * 36;
         float d = *(device const float *)blk;
-        device const char *qs = (device const char *)(blk + 4);
+        device const char4  *qs = (device const char4 *)(blk + 4);
+        device const float4 *xv = (device const float4 *)(x + j * 32);
         float local = 0.0f;
-        for (uint l = 0; l < 32; l++) local += float(qs[l]) * x[j * 32 + l];
+        for (uint l = 0; l < 8; l++) {
+            float4 qf = float4(qs[l]);
+            float4 xf = xv[l];
+            local += qf.x*xf.x + qf.y*xf.y + qf.z*xf.z + qf.w*xf.w;
+        }
         sum += d * local;
     }
-    partial[tid] = sum;
+    sum = simd_sum(sum);
+    if (simd_lane == 0) partial[simd_grp] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgSz / 2; s > 0; s >>= 1) {
-        if (tid < s) partial[tid] += partial[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (uint i = 0; i < tgSz / 32; i++) t += partial[i];
+        dst[row] = t;
     }
-    if (tid == 0) dst[row] = partial[0];
 }
 
 // ---------------------------------------------------------------------
-// Q4_K matmul -- mirrors dequantize_row_q4_K + the matmul loop in hy3.c,
+// Q8_0 matmul, SIMD-group vectorized variant (matmul_q8_0_mm).
+//
+// Same math as matmul_q8_0 above, restructured after llama.cpp's
+// kernel_mul_mv_q8_0_f32 for higher memory-bandwidth utilization:
+//   - One SIMD-group (32 lanes) cooperatively computes Q8_0_N_ROWS output
+//     rows at once. The 32 lanes split so ix = lane/4 picks one of 8
+//     blocks and il = lane%4 picks 8 of the 32 quants in that block;
+//     consecutive lanes read consecutive words (coalesced loads).
+//   - Each lane keeps a partial sum per row; a final simd_sum reduces the
+//     32 lanes and lane 0 writes the result.
+//
+// Dispatch: threadgroups = ceil(m_rows / Q8_0_N_ROWS), 32 threads each.
+// Buffer/arg layout identical to matmul_q8_0 (dst,w,x,n).
+//
+// hy3 block_q8_0 (36 bytes / 32 elems): float d, int8 qs[32].
+// ---------------------------------------------------------------------
+
+#define Q8_0_N_ROWS 4
+
+kernel void matmul_q8_0_mm(device float       *dst [[buffer(0)]],
+                            device const uchar *w   [[buffer(1)]],
+                            device const float *x   [[buffer(2)]],
+                            constant uint      &n   [[buffer(3)]],
+                            uint  tgpig [[threadgroup_position_in_grid]],
+                            ushort tiisg [[thread_index_in_simdgroup]])
+{
+    const short NQ = 8;           // quants handled per lane per block
+    const short ix = tiisg / 4;   // 0..7  -> which block within a stride
+    const short il = tiisg % 4;   // 0..3  -> which 8-quant slice of the block
+
+    const uint nb = n / 32;       // blocks per row
+    const uint first_row = (uint)tgpig * Q8_0_N_ROWS;
+    const uint row_stride = nb * 36;   // bytes per weight row
+
+    float sumf[Q8_0_N_ROWS] = {0.f};
+    float yl[8];
+
+    device const float *yb = x + ix * 32 + il * NQ;
+
+    for (uint ib = ix; ib < nb; ib += 8) {
+        for (short i = 0; i < NQ; ++i) yl[i] = yb[i];
+
+        device const uchar *blk0 = w + first_row * row_stride + (size_t)ib * 36;
+        for (short row = 0; row < Q8_0_N_ROWS; row++) {
+            device const uchar *blk = blk0 + (size_t)row * row_stride;
+            float d = *(device const float *)blk;
+            device const char *qs = (device const char *)(blk + 4) + il * NQ;
+            float sumq = 0.f;
+            for (short i = 0; i < NQ; ++i) sumq += (float)qs[i] * yl[i];
+            sumf[row] += sumq * d;
+        }
+
+        yb += 8 * 32;
+    }
+
+    for (short row = 0; row < Q8_0_N_ROWS; row++) {
+        float tot = simd_sum(sumf[row]);
+        if (tiisg == 0) dst[first_row + row] = tot;
+    }
+}
 // but dequantizes inline instead of materializing a temporary buffer.
 // Block layout (144 bytes / 256 elems): fp16 d, fp16 dmin, 12 bytes of
 // packed 6-bit (scale,min) pairs for 8 sub-blocks, 128 bytes of 4-bit
@@ -406,6 +516,8 @@ inline void hy3_q4k_get_scale_min(uint j, device const uchar *q, thread uchar &s
 }
 
 // One block dot product against a contiguous 256-float slice of x.
+// Vectorized: process the 32 nibble-bytes of each sub-block pair as uchar4
+// against float4 activation lanes.
 inline float hy3_q4k_dot_block(device const uchar *blk, device const float *xb) {
     half dh   = *(device const half *)blk;
     half dmh  = *(device const half *)(blk + 2);
@@ -421,11 +533,18 @@ inline float hy3_q4k_dot_block(device const uchar *blk, device const float *xb) 
         hy3_q4k_get_scale_min(is + 1, sc, sc2, m2);
         float d1 = d * float(sc1), dm1 = dmin * float(m1);
         float d2 = d * float(sc2), dm2 = dmin * float(m2);
-        device const uchar *qq = q + (j / 2);
-        for (uint l = 0; l < 32; l++) {
-            float v1 = d1 * float(qq[l] & 0xF) - dm1;
-            float v2 = d2 * float(qq[l] >> 4)  - dm2;
-            acc += v1 * xb[j + l] + v2 * xb[j + 32 + l];
+        device const uchar4 *qq = (device const uchar4 *)(q + (j / 2));
+        device const float4 *x1 = (device const float4 *)(xb + j);
+        device const float4 *x2 = (device const float4 *)(xb + j + 32);
+        for (uint l = 0; l < 8; l++) {
+            uchar4 packed = qq[l];
+            float4 lo = float4(packed & 0xF);
+            float4 hi = float4(packed >> 4);
+            float4 v1 = d1 * lo - dm1;
+            float4 v2 = d2 * hi - dm2;
+            float4 a1 = x1[l], a2 = x2[l];
+            acc += v1.x*a1.x + v1.y*a1.y + v1.z*a1.z + v1.w*a1.w
+                 + v2.x*a2.x + v2.y*a2.y + v2.z*a2.z + v2.w*a2.w;
         }
         is += 2;
     }
@@ -438,9 +557,11 @@ kernel void matmul_q4_k(device float       *dst [[buffer(0)]],
                          constant uint      &n   [[buffer(3)]],
                          uint row  [[threadgroup_position_in_grid]],
                          uint tid  [[thread_index_in_threadgroup]],
-                         uint tgSz [[threads_per_threadgroup]])
+                         uint tgSz [[threads_per_threadgroup]],
+                         uint simd_lane [[thread_index_in_simdgroup]],
+                         uint simd_grp  [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float partial[256];
+    threadgroup float partial[8];
     uint nb = n / 256;
     device const uchar *wr = w + (size_t)row * nb * 144;
     float sum = 0.0f;
@@ -448,11 +569,294 @@ kernel void matmul_q4_k(device float       *dst [[buffer(0)]],
         device const uchar *blk = wr + (size_t)bi * 144;
         sum += hy3_q4k_dot_block(blk, x + (size_t)bi * 256);
     }
-    partial[tid] = sum;
+    sum = simd_sum(sum);
+    if (simd_lane == 0) partial[simd_grp] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgSz / 2; s > 0; s >>= 1) {
-        if (tid < s) partial[tid] += partial[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (uint i = 0; i < tgSz / 32; i++) t += partial[i];
+        dst[row] = t;
     }
-    if (tid == 0) dst[row] = partial[0];
 }
+
+// ---------------------------------------------------------------------
+// Q4_K matmul, SIMD-group vectorized variant (matmul_q4_k_mm).
+//
+// Same math as matmul_q4_k above, but restructured after llama.cpp's
+// kernel_mul_mv_q4_K_f32 for far higher memory-bandwidth utilization:
+//   - One SIMD-group (32 lanes) cooperatively computes Q4K_N_ROWS output
+//     rows at once. The 32 lanes split into 4 groups of 8 (ix = lane/8),
+//     each group striding over the super-blocks (ib += 4), so consecutive
+//     lanes read consecutive weight/activation words (coalesced loads).
+//   - The 6-bit (scale,min) pairs are unpacked with the same kmask trick
+//     as ggml; the 4-bit weights are multiplied against the activations
+//     without materializing a dequantized row.
+//   - Each lane keeps a partial sum per row; a final simd_sum reduces the
+//     32 lanes and lane 0 writes the result.
+//
+// Dispatch: threadgroups = ceil(m_rows / Q4K_N_ROWS), 32 threads each.
+// Buffer/arg layout is identical to matmul_q4_k (dst,w,x,n) so the host
+// only changes the pipeline + grid, not the bindings.
+//
+// hy3 block_q4_K (144 bytes / 256 elems): half d, half dmin, 12 bytes of
+// packed 6-bit (scale,min) pairs, 128 bytes of 4-bit weights.
+// ---------------------------------------------------------------------
+
+#define Q4K_N_ROWS 4
+
+kernel void matmul_q4_k_mm(device float       *dst [[buffer(0)]],
+                            device const uchar *w   [[buffer(1)]],
+                            device const float *x   [[buffer(2)]],
+                            constant uint      &n   [[buffer(3)]],
+                            uint  tgpig [[threadgroup_position_in_grid]],
+                            ushort tiisg [[thread_index_in_simdgroup]])
+{
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+
+    const short ix = tiisg / 8;   // 0..3  -> which super-block within a stride
+    const short it = tiisg % 8;   // 0..7
+    const short iq = it / 4;      // 0 or 1
+    const short ir = it % 4;      // 0..3
+
+    const uint nb = n / 256;      // super-blocks per row
+    const uint first_row = (uint)tgpig * Q4K_N_ROWS;
+    const uint row_stride = nb * 144;   // bytes per weight row
+
+    float yl[16];
+    float yh[16];
+    float sumf[Q4K_N_ROWS] = {0.f};
+
+    device const float *y4 = x + ix * 256 + 64 * iq + 8 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
+
+    for (uint ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        device const uchar *blk0 = w + first_row * row_stride + (size_t)ib * 144;
+
+        for (short row = 0; row < Q4K_N_ROWS; row++) {
+            device const uchar *blk = blk0 + (size_t)row * row_stride;
+            device const half     *dh = (device const half *)blk;
+            device const uint16_t *sc = (device const uint16_t *)(blk + 4) + iq;
+            device const uint16_t *q1 = (device const uint16_t *)(blk + 16) + 16 * iq + 4 * ir;
+
+            sc16[0] =  sc[0] & kmask1;
+            sc16[1] =  sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t *q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+            }
+
+            float d    = (float)dh[0];
+            float dmin = (float)dh[1];
+
+            sumf[row] += d * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
+                              (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
+                              (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
+                              (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
+                         dmin * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
+                                 sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        }
+
+        y4 += 4 * 256;
+    }
+
+    for (short row = 0; row < Q4K_N_ROWS; row++) {
+        float tot = simd_sum(sumf[row]);
+        if (tiisg == 0) dst[first_row + row] = tot;
+    }
+}
+
+// =====================================================================
+// FAST MoE PATH (ds4-style, keeps the whole token on the GPU).
+//
+// router_topk : GPU-side top-k over the router logits. Emits the chosen
+//               expert ids and their renormalized+scaled combine weights,
+//               so the CPU never has to read router logits mid-token.
+// q4k_mul_mv_id : one dispatch computes ALL K routed experts. tgpig.y is
+//               the expert slot; the real expert id and combine weight come
+//               from GPU buffers. Weights of a layer's experts are laid out
+//               contiguously in the mmap with a fixed byte stride, so an
+//               expert base pointer + id*stride locates any expert.
+// =====================================================================
+
+kernel void router_topk(device const float *logits [[buffer(0)]],  // NE
+                        device const float *bias   [[buffer(1)]],  // NE (unused if has_bias==0)
+                        device int         *out_ids [[buffer(2)]], // K
+                        device float       *out_wts [[buffer(3)]], // K
+                        constant uint      &NE      [[buffer(4)]],
+                        constant uint      &K       [[buffer(5)]],
+                        constant uint      &has_bias[[buffer(6)]],
+                        constant float     &scaling [[buffer(7)]],
+                        uint tid  [[thread_index_in_threadgroup]],
+                        uint tgSz [[threads_per_threadgroup]])
+{
+    threadgroup float sig[256];    // sigmoid(logit)
+    threadgroup float scored[256]; // sigmoid + bias (selection score)
+    for (uint i = tid; i < NE; i += tgSz) {
+        float s = 1.0f / (1.0f + exp(-logits[i]));
+        sig[i] = s;
+        scored[i] = s + (has_bias ? bias[i] : 0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float sum_w = 0.0f;
+        for (uint k = 0; k < K; k++) {
+            int best = -1; float bv = -1e30f;
+            for (uint i = 0; i < NE; i++) {
+                float v = scored[i];
+                if (v > bv) { bv = v; best = (int)i; }
+            }
+            out_ids[k] = best;
+            out_wts[k] = sig[best];   // temporarily store unbiased sigmoid
+            sum_w += sig[best];
+            scored[best] = -1e30f;
+        }
+        float inv = 1.0f / (sum_w + 1e-20f);
+        for (uint k = 0; k < K; k++)
+            out_wts[k] = out_wts[k] * inv * scaling;
+    }
+}
+
+// One dispatch = all K routed experts, Q4_K. grid = (M/4, K, 1), 32 threads.
+// dst layout: [slot*M + row]. experts points at expert 0's weights; expert
+// `ids[slot]` starts at experts + ids[slot]*expert_stride bytes.
+kernel void matmul_q4_k_id(device float       *dst     [[buffer(0)]], // K*M
+                           device const uchar *experts [[buffer(1)]],
+                           device const float *x       [[buffer(2)]], // N or K*N (see x_per_slot)
+                           constant uint      &n       [[buffer(3)]],
+                           constant uint      &M       [[buffer(4)]],
+                           constant uint      &expert_stride [[buffer(5)]],
+                           device const int   *ids     [[buffer(6)]], // K
+                           constant uint      &x_per_slot [[buffer(7)]], // 0: shared x, 1: x+slot*n
+                           uint3  tgpig [[threadgroup_position_in_grid]],
+                           ushort tiisg [[thread_index_in_simdgroup]])
+{
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+
+    const uint slot = tgpig.y;
+    const int  eid  = ids[slot];
+    device const uchar *w = experts + (size_t)eid * expert_stride;
+    device const float *xs = x_per_slot ? (x + (size_t)slot * n) : x;
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+
+    const uint nb = n / 256;
+    const uint first_row = (uint)tgpig.x * 4;
+    const uint row_stride = nb * 144;
+
+    float yl[16];
+    float yh[16];
+    float sumf[4] = {0.f};
+
+    device const float *y4 = xs + ix * 256 + 64 * iq + 8 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
+
+    for (uint ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+        device const uchar *blk0 = w + first_row * row_stride + (size_t)ib * 144;
+        for (short row = 0; row < 4; row++) {
+            device const uchar *blk = blk0 + (size_t)row * row_stride;
+            device const half     *dh = (device const half *)blk;
+            device const uint16_t *sc = (device const uint16_t *)(blk + 4) + iq;
+            device const uint16_t *q1 = (device const uint16_t *)(blk + 16) + 16 * iq + 4 * ir;
+            sc16[0] =  sc[0] & kmask1;
+            sc16[1] =  sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            device const uint16_t *q2 = q1 + 32;
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+            }
+            float d    = (float)dh[0];
+            float dmin = (float)dh[1];
+            sumf[row] += d * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
+                              (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
+                              (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
+                              (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
+                         dmin * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
+                                 sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        }
+        y4 += 4 * 256;
+    }
+    for (short row = 0; row < 4; row++) {
+        float tot = simd_sum(sumf[row]);
+        if (tiisg == 0) dst[(size_t)slot * M + first_row + row] = tot;
+    }
+}
+
+// SwiGLU for all K slots at once: mid[i] = silu(gate[i]) * up[i], i in [0,K*M).
+kernel void moe_swiglu_id(device float       *mid  [[buffer(0)]], // K*M
+                          device const float *gate [[buffer(1)]], // K*M
+                          device const float *up   [[buffer(2)]], // K*M
+                          constant uint      &total[[buffer(3)]], // K*M
+                          uint i [[thread_position_in_grid]])
+{
+    if (i >= total) return;
+    float g = gate[i];
+    float s = g / (1.0f + exp(-g));
+    mid[i] = s * up[i];
+}
+
+// Weighted combine of K routed-expert down-projections into the residual:
+//   embed[r] += sum_slot  wt[slot] * down[slot*M + r]
+kernel void moe_combine_id(device float       *embed [[buffer(0)]], // M (+=)
+                           device const float *down  [[buffer(1)]], // K*M
+                           device const float *wt    [[buffer(2)]], // K
+                           constant uint      &M     [[buffer(3)]],
+                           constant uint      &K     [[buffer(4)]],
+                           uint r [[thread_position_in_grid]])
+{
+    if (r >= M) return;
+    float acc = 0.0f;
+    for (uint k = 0; k < K; k++) acc += wt[k] * down[(size_t)k * M + r];
+    embed[r] += acc;
+}
+
+

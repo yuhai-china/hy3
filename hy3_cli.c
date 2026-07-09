@@ -23,6 +23,77 @@ static int emit_token(void *ud, int token) {
     return 0;
 }
 
+/* Unescape a batch-file line in place: turn the two-character sequence "\n"
+ * into a real newline and "\\" into a single backslash, so multi-line prompts
+ * can be stored one-per-line. Returns the new length. */
+static size_t unescape_inplace(char *s) {
+    char *w = s;
+    for (char *r = s; *r; r++) {
+        if (r[0] == '\\' && r[1] == 'n')      { *w++ = '\n'; r++; }
+        else if (r[0] == '\\' && r[1] == 't') { *w++ = '\t'; r++; }
+        else if (r[0] == '\\' && r[1] == '\\'){ *w++ = '\\'; r++; }
+        else                                   { *w++ = *r; }
+    }
+    *w = 0;
+    return (size_t)(w - s);
+}
+
+/* Batch mode: read one prompt per line from `path`, run each through a fresh
+ * context on the already-loaded model, and frame every answer with
+ * <<<HY3_BEGIN i>>> / <<<HY3_END>>> markers so a harness can split them.
+ * Returns 0 on success, non-zero if the file can't be opened. */
+static int run_batch(hy3_model *model, const char *path, int n_predict,
+                     hy3_params *params, int raw_prompt, int think) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "hy3: cannot open batch file '%s'\n", path);
+        return 1;
+    }
+    /* Lines may be long (code prompts); grow the buffer as needed. */
+    size_t cap = 1 << 16;
+    char *line = malloc(cap);
+    if (!line) { fclose(f); return 1; }
+
+    int idx = 0;
+    while (fgets(line, (int)cap, f)) {
+        /* Extend the buffer if the line didn't fit (no trailing newline and
+         * not EOF-terminated). */
+        size_t len = strlen(line);
+        while (len == cap - 1 && line[len - 1] != '\n') {
+            char *bigger = realloc(line, cap * 2);
+            if (!bigger) break;
+            line = bigger;
+            if (!fgets(line + len, (int)(cap + 1), f)) break;
+            cap *= 2;
+            len = strlen(line);
+        }
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = 0;
+        if (len == 0) continue;
+
+        unescape_inplace(line);
+
+        hy3_reset_context(model);
+        hy3_tokens input;
+        memset(&input, 0, sizeof(input));
+        if (raw_prompt) hy3_tokenize(model, line, &input);
+        else            hy3_tokenize_chat(model, line, think, &input);
+
+        printf("<<<HY3_BEGIN %d>>>\n", idx);
+        fflush(stdout);
+        hy3_generate(model, &input, n_predict, params, emit_token, model);
+        printf("\n<<<HY3_END>>>\n");
+        fflush(stdout);
+
+        hy3_tokens_free(&input);
+        idx++;
+    }
+    free(line);
+    fclose(f);
+    fprintf(stderr, "hy3: batch complete, %d prompt(s) processed\n", idx);
+    return 0;
+}
+
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options] -m <model.gguf> [prompt]\n", prog);
     fprintf(stderr, "\nOptions:\n");
@@ -33,6 +104,12 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -temp <f>     Temperature (default: 0.9)\n");
     fprintf(stderr, "  -top_k <n>    Top-k sampling (default: 0 = off)\n");
     fprintf(stderr, "  -top_p <f>    Top-p sampling (default: 1.0)\n");
+    fprintf(stderr, "  -experts <n>  MoE experts per token (1..8, default: 8; lower = faster)\n");
+    fprintf(stderr, "  --raw         Feed the prompt as raw text (no chat template)\n");
+    fprintf(stderr, "  --think       Enable the model's reasoning block (default: no_think)\n");
+    fprintf(stderr, "  --batch <f>   Batch mode: run every prompt line in file <f> (model loads once).\n");
+    fprintf(stderr, "                Each line is one prompt with \\n escaped; blank lines skipped.\n");
+    fprintf(stderr, "                Output is framed by <<<HY3_BEGIN i>>> ... <<<HY3_END>>> markers.\n");
     fprintf(stderr, "  --gpu         Use GPU acceleration (CUDA)\n");
     fprintf(stderr, "  --gpu-layers <n>  Number of layers to offload to CUDA GPU\n");
     fprintf(stderr, "  --metal       Use Metal acceleration (macOS/Apple Silicon, all layers)\n");
@@ -53,6 +130,10 @@ int main(int argc, char **argv) {
     const char *prompt = NULL;
     int n_predict = 512;
     int use_metal = 0;
+    int n_experts = 0;   /* 0 = leave model default (from HY3_TOP_K_EXPERTS or 8) */
+    int raw_prompt = 0;  /* 0 = apply chat template, 1 = feed raw text */
+    int think = 0;       /* reasoning block: 0 = no_think, 1 = think */
+    const char *batch_file = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -69,6 +150,14 @@ int main(int argc, char **argv) {
             params.top_k = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-top_p") == 0 && i + 1 < argc) {
             params.top_p = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-experts") == 0 && i + 1 < argc) {
+            n_experts = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--raw") == 0) {
+            raw_prompt = 1;
+        } else if (strcmp(argv[i], "--think") == 0) {
+            think = 1;
+        } else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
+            batch_file = argv[++i];
         } else if (strcmp(argv[i], "--gpu") == 0) {
             params.use_gpu = 1;
         } else if (strcmp(argv[i], "--gpu-layers") == 0 && i + 1 < argc) {
@@ -93,6 +182,16 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (n_experts != 0) {
+        if (n_experts >= 1 && n_experts <= HY3_N_EXPERT_USED) {
+            model->n_expert_used = n_experts;
+        } else {
+            fprintf(stderr, "hy3: -experts %d out of range (1..%d), using %d\n",
+                    n_experts, HY3_N_EXPERT_USED, model->n_expert_used);
+        }
+    }
+    fprintf(stderr, "hy3: MoE experts per token = %d\n", model->n_expert_used);
+
 #ifdef HY3_CUDA
     if (params.use_gpu) {
         if (hy3_gpu_init(model, params.gpu_layers) != 0) {
@@ -114,10 +213,17 @@ int main(int argc, char **argv) {
     (void)use_metal;
 #endif
 
+    if (batch_file) {
+        int rc = run_batch(model, batch_file, n_predict, &params, raw_prompt, think);
+        hy3_model_free(model);
+        return rc;
+    }
+
     if (prompt && prompt[0]) {
         hy3_tokens input;
         memset(&input, 0, sizeof(input));
-        hy3_tokenize(model, prompt, &input);
+        if (raw_prompt) hy3_tokenize(model, prompt, &input);
+        else            hy3_tokenize_chat(model, prompt, think, &input);
 
         hy3_generate(model, &input, n_predict, &params, emit_token, model);
         printf("\n");
@@ -136,7 +242,8 @@ int main(int argc, char **argv) {
 
             hy3_tokens input;
             memset(&input, 0, sizeof(input));
-            hy3_tokenize(model, line, &input);
+            if (raw_prompt) hy3_tokenize(model, line, &input);
+            else            hy3_tokenize_chat(model, line, think, &input);
 
             printf("\n");
             hy3_generate(model, &input, n_predict, &params, emit_token, model);

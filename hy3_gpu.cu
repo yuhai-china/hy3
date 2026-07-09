@@ -894,27 +894,28 @@ int hy3_eval_gpu(hy3_model *m, const hy3_tokens *tokens, float *logits, int *pos
                 /* Topk on biased scores */
                 float topk_vals[HY3_N_EXPERT_USED];
                 int topk_inds[HY3_N_EXPERT_USED];
+                int n_used = m->n_expert_used;
                 {
                     float tv[HY3_N_EXPERT]; int ti[HY3_N_EXPERT];
                     for (int i = 0; i < HY3_N_EXPERT; i++) { ti[i] = i; tv[i] = h_scores[i]; }
-                    for (int i = 0; i < HY3_N_EXPERT_USED; i++) {
+                    for (int i = 0; i < n_used; i++) {
                         int best = i;
                         for (int j = i+1; j < HY3_N_EXPERT; j++)
                             if (tv[j] > tv[best]) best = j;
                         float f = tv[i]; tv[i] = tv[best]; tv[best] = f;
                         int x = ti[i]; ti[i] = ti[best]; ti[best] = x;
                     }
-                    for (int i = 0; i < HY3_N_EXPERT_USED; i++) { topk_vals[i] = 0; topk_inds[i] = ti[i]; }
+                    for (int i = 0; i < n_used; i++) { topk_vals[i] = 0; topk_inds[i] = ti[i]; }
                 }
 
                 /* Gather sigmoid-only weights, normalize, scale */
                 float sum_w = 0;
-                for (int e = 0; e < HY3_N_EXPERT_USED; e++) {
+                for (int e = 0; e < n_used; e++) {
                     topk_vals[e] = h_sigmoid[topk_inds[e]];
                     sum_w += topk_vals[e];
                 }
                 float inv_sum = 1.0f / (sum_w + 1e-20f);
-                for (int e = 0; e < HY3_N_EXPERT_USED; e++)
+                for (int e = 0; e < n_used; e++)
                     topk_vals[e] *= inv_sum * 2.826f;
 
                 /* Shared expert (dense — use cuBLAS) */
@@ -946,7 +947,7 @@ int hy3_eval_gpu(hy3_model *m, const hy3_tokens *tokens, float *logits, int *pos
                 int out_fill_grid = (HY3_N_EMBD + BLOCK_DIM - 1) / BLOCK_DIM;
                 fill_zero_kernel<<<out_fill_grid, BLOCK_DIM>>>(expert_out, HY3_N_EMBD);
 
-                for (int e = 0; e < HY3_N_EXPERT_USED; e++) {
+                for (int e = 0; e < n_used; e++) {
                     int ei = topk_inds[e];
                     float w = topk_vals[e];
 

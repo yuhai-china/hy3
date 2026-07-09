@@ -95,5 +95,9 @@ hy3.o: hy3.c hy3.h
 hy3_cli.o: hy3_cli.c hy3.h
 	$(CC) $(CFLAGS) -c -o $@ hy3_cli.c
 
+# Standalone Metal kernel experiment bed (macOS only). Not part of `all`.
+fast_metal: fast_metal.m
+	$(CC) -O3 -fobjc-arc -o $@ fast_metal.m -framework Metal -framework Foundation
+
 clean:
-	rm -f hy3 hy3-cli hy3-convert *.o
+	rm -f hy3 hy3-cli hy3-convert fast_metal *.o

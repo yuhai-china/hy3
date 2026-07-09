@@ -62,6 +62,7 @@ const char *hy3_model_name(hy3_model *m);
 int hy3_model_ctx_size(hy3_model *m);
 
 void hy3_tokenize(hy3_model *m, const char *text, hy3_tokens *out);
+void hy3_tokenize_chat(hy3_model *m, const char *user_text, int think, hy3_tokens *out);
 int hy3_detokenize(hy3_model *m, int token, char *buf, size_t cap);
 int hy3_token_eos(hy3_model *m);
 int hy3_token_bos(hy3_model *m);
@@ -74,6 +75,7 @@ int hy3_eval(hy3_model *m, const hy3_tokens *tokens, float *logits, int *pos);
 int hy3_eval_gpu(hy3_model *m, const hy3_tokens *tokens, float *logits, int *pos);
 int hy3_eval_metal(hy3_model *m, const hy3_tokens *tokens, float *logits, int *pos);
 int hy3_sample(hy3_model *m, const float *logits, float temperature, int top_k, float top_p);
+void hy3_reset_context(hy3_model *m);
 
 void forward_layer_dense(hy3_model *m, int il, int pos);
 void forward_layer_moe(hy3_model *m, int il, int pos);
@@ -171,6 +173,7 @@ struct hy3_model {
     uint64_t rng_state;
     double t_load;
     int ctx_size;
+    int n_expert_used;   /* runtime top-k for MoE routing; default HY3_N_EXPERT_USED, clamped to [1, HY3_N_EXPERT_USED] */
 
     float *embed;
     float *cache_k;

@@ -713,6 +713,21 @@ int hy3_model_load(hy3_model **out, const char *path, int n_threads) {
     m->gpu_layers = 81;
     m->rng_state = (uint64_t)(uintptr_t)m ^ (uint64_t)time(NULL);
 
+    /* Runtime MoE top-k. Defaults to the model's native HY3_N_EXPERT_USED (8)
+     * but can be lowered (e.g. 4 or 2) via HY3_TOP_K_EXPERTS or the CLI to
+     * trade quality for speed. Clamped to [1, HY3_N_EXPERT_USED] so the
+     * fixed-size top-k arrays are never overrun. */
+    m->n_expert_used = HY3_N_EXPERT_USED;
+    {
+        const char *env = getenv("HY3_TOP_K_EXPERTS");
+        if (env && env[0]) {
+            int k = atoi(env);
+            if (k >= 1 && k <= HY3_N_EXPERT_USED) m->n_expert_used = k;
+            else fprintf(stderr, "hy3: ignoring HY3_TOP_K_EXPERTS=%s (must be 1..%d)\n",
+                         env, HY3_N_EXPERT_USED);
+        }
+    }
+
     hy3_gguf_model *g = &m->gguf;
     g->fd = -1;
 
@@ -830,6 +845,13 @@ void hy3_model_free(hy3_model *m) {
 /* Expose weights pointer for GPU integration */
 const hy3_weights *hy3_get_weights(const hy3_model *m) { return &m->w; }
 void hy3_set_gpu_ctx(hy3_model *m, void *ctx) { m->gpu_ctx = ctx; }
+
+/* Reset conversational state so the next hy3_generate() starts a fresh context.
+ * The KV cache is keyed by m->cache_len (slot = token_idx*HY3_N_LAYER+layer),
+ * so zeroing it is sufficient for both the CPU and Metal paths -- old slots are
+ * simply overwritten from the start. Used by batch mode to reuse one loaded
+ * model across many independent prompts. */
+void hy3_reset_context(hy3_model *m) { m->cache_len = 0; }
 
 int hy3_model_vocab_size(hy3_model *m) { return HY3_N_VOCAB; }
 const char *hy3_model_name(hy3_model *m) { return "HYV3ForCausalLM"; }
@@ -1133,15 +1155,16 @@ void forward_layer_moe(hy3_model *m, int il, int pos) {
 
     float topk_vals[HY3_N_EXPERT_USED];
     int topk_inds[HY3_N_EXPERT_USED];
-    topk_select(topk_vals, topk_inds, router_logits, HY3_N_EXPERT, HY3_N_EXPERT_USED);
+    int n_used = m->n_expert_used;
+    topk_select(topk_vals, topk_inds, router_logits, HY3_N_EXPERT, n_used);
     float sum_w = 0;
-    for (int i = 0; i < HY3_N_EXPERT_USED; i++) {
+    for (int i = 0; i < n_used; i++) {
         topk_vals[i] = sigmoid_vals[topk_inds[i]];
         sum_w += topk_vals[i];
     }
     float inv_sum = 1.0f / (sum_w + 1e-20f);
     float router_scaling = 2.826f;
-    for (int i = 0; i < HY3_N_EXPERT_USED; i++)
+    for (int i = 0; i < n_used; i++)
         topk_vals[i] = topk_vals[i] * inv_sum * router_scaling;
 
     float *shared_gate = m->scratch2 + HY3_N_EXPERT;
@@ -1158,7 +1181,7 @@ void forward_layer_moe(hy3_model *m, int il, int pos) {
     float *gate_buf = m->scratch2 + HY3_N_EXPERT + HY3_MOE_INTERMED * 2 + HY3_N_EMBD;
     float *up_buf = gate_buf + HY3_MOE_INTERMED;
     float *down_buf = up_buf + HY3_MOE_INTERMED;
-    for (int e = 0; e < HY3_N_EXPERT_USED; e++) {
+    for (int e = 0; e < n_used; e++) {
         int ei = topk_inds[e];
         mul_mat_f32(gate_buf, l->ffn_gate_exps[ei].data, l->ffn_gate_exps[ei].t->ggml_type,
                     s, HY3_MOE_INTERMED, HY3_N_EMBD);
@@ -1357,8 +1380,9 @@ int hy3_generate(hy3_model *m, const hy3_tokens *prompt,
 
     for (int i = 0; i < n_predict; i++) {
         int token = hy3_sample(m, logits, params->temperature, params->top_k, params->top_p);
-        if (token == hy3_token_eos(m)) {
-            if (emit) emit(emit_ud, token);
+        /* Stop on any Hunyuan V3 end-of-turn / end-of-sequence marker:
+         * eos(120025), endofsentence(120001), EOT(120008). */
+        if (token == hy3_token_eos(m) || token == 120001 || token == 120008) {
             break;
         }
 
@@ -1426,6 +1450,44 @@ static const hy3_vocab_entry *find_vocab_entry(int id) {
 
 static int utf8_decode(const uint8_t *s, size_t n, uint32_t *cp);
 static int unicode_to_byte(uint32_t cp);
+
+/* Inverse of unicode_to_byte: map a raw byte (0..255) to the GPT-2 byte-level
+ * BPE "surface" codepoint used in the vocab. Printable ASCII / Latin-1 map to
+ * themselves; the control/space bytes are shifted into the 0x100.. range. */
+static uint32_t byte_to_unicode(uint8_t b) {
+    if (b >= 0x21 && b <= 0x7E) return b;
+    if (b >= 0xA1 && b <= 0xAC) return b;
+    if (b >= 0xAE && b <= 0xFF) return b;
+    /* bytes 0..32, 127, 128..160, 173 -> 0x100 + running index */
+    uint32_t idx = 0;
+    for (uint32_t x = 0; x < b; x++) {
+        if ((x >= 0x21 && x <= 0x7E) || (x >= 0xA1 && x <= 0xAC) || (x >= 0xAE && x <= 0xFF))
+            continue;
+        idx++;
+    }
+    return 0x100 + idx;
+}
+
+/* Encode a codepoint as UTF-8 into buf (must hold >=4 bytes). Returns length. */
+static size_t utf8_encode(uint32_t cp, char *buf) {
+    if (cp < 0x80) { buf[0] = (char)cp; return 1; }
+    if (cp < 0x800) {
+        buf[0] = (char)(0xC0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        buf[0] = (char)(0xE0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    buf[0] = (char)(0xF0 | (cp >> 18));
+    buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    buf[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
 
 void hy3_tokenize(hy3_model *m, const char *text, hy3_tokens *out) {
     const hy3_gguf_model *g = &m->gguf;
@@ -1533,14 +1595,30 @@ void hy3_tokenize(hy3_model *m, const char *text, hy3_tokens *out) {
         }
     }
 
-    int len = (int)strlen(text);
+    int raw_len = (int)strlen(text);
+
+    /* Convert the raw UTF-8 input into the GPT-2 byte-level "surface" string:
+     * every raw byte is remapped to its surface codepoint and re-encoded as
+     * UTF-8. The vocab stores tokens in exactly this surface form (e.g. the
+     * Chinese char "\xE4\xBD\xA0" is stored as three surface codepoints), so
+     * matching must happen in surface space, not against the raw bytes. */
+    char *surf = xmalloc((size_t)raw_len * 4 + 1);
+    int surf_len = 0;
+    for (int i = 0; i < raw_len; i++) {
+        uint32_t cp = byte_to_unicode((uint8_t)text[i]);
+        surf_len += (int)utf8_encode(cp, surf + surf_len);
+    }
+    surf[surf_len] = 0;
+
+    int len = surf_len;
+    const char *stext = surf;
     for (int i = 0; i < len; ) {
         int best_id = -1;
         int best_len = 1;
         for (int j = 0; j < vocab_size; j++) {
             hy3_str t = vocab[j].text;
             if (t.len > 0 && (size_t)(len - i) >= t.len &&
-                memcmp(text + i, t.ptr, t.len) == 0) {
+                memcmp(stext + i, t.ptr, t.len) == 0) {
                 if ((int)t.len > best_len) {
                     best_len = (int)t.len;
                     best_id = vocab[j].id;
@@ -1548,7 +1626,7 @@ void hy3_tokenize(hy3_model *m, const char *text, hy3_tokens *out) {
             }
         }
         if (best_id < 0 && i < len) {
-            unsigned char b = (unsigned char)text[i];
+            unsigned char b = (unsigned char)stext[i];
             best_id = byte_to_token[b];
             if (best_id < 0) best_id = (int)b;
             best_len = 1;
@@ -1557,7 +1635,45 @@ void hy3_tokenize(hy3_model *m, const char *text, hy3_tokens *out) {
         if (best_id >= 0)
             hy3_tokens_push(out, best_id);
     }
+
+    free(surf);
 }
+
+/* Hunyuan V3 special token IDs (verified against the GGUF vocab). These are
+ * stored in the vocab as raw UTF-8 (with the fullwidth bar U+FF5C), NOT in the
+ * byte-level surface encoding that hy3_tokenize applies, so they must be
+ * injected by ID rather than tokenized from text. */
+#define HY3_TOK_BOS            120000  /* <|hy_begin_of_sentence:opensource|> */
+#define HY3_TOK_USER           120006  /* <|hy_User:opensource|> */
+#define HY3_TOK_ASSISTANT      120007  /* <|hy_Assistant:opensource|> */
+#define HY3_TOK_THINK_BEGIN    120029  /* <think:opensource> */
+#define HY3_TOK_THINK_END      120030  /* </think:opensource> */
+#define HY3_TOK_REASONING_MODE 120044  /* <|reasoning_mode:opensource|> */
+
+/* Build the chat-formatted prompt for a single user turn, matching
+ * tencent/Hy3 chat_template.jinja with the defaults used for inference:
+ * no system prompt, no tools, add_generation_prompt=true, and
+ * reasoning_effort="no_think" (so an empty <think></think> block is emitted
+ * and the model answers directly).
+ *
+ * Rendered sequence:
+ *   BOS REASONING_MODE "reasoning_effort:no_think" USER <prompt>
+ *   ASSISTANT THINK_BEGIN THINK_END
+ *
+ * think controls the reasoning block: 0 = no_think (empty think block, direct
+ * answer), 1 = let the model think (only THINK_BEGIN is emitted so generation
+ * starts inside the reasoning block). */
+void hy3_tokenize_chat(hy3_model *m, const char *user_text, int think, hy3_tokens *out) {
+    hy3_tokens_push(out, HY3_TOK_BOS);
+    hy3_tokens_push(out, HY3_TOK_REASONING_MODE);
+    hy3_tokenize(m, think ? "reasoning_effort:high" : "reasoning_effort:no_think", out);
+    hy3_tokens_push(out, HY3_TOK_USER);
+    hy3_tokenize(m, user_text, out);
+    hy3_tokens_push(out, HY3_TOK_ASSISTANT);
+    hy3_tokens_push(out, HY3_TOK_THINK_BEGIN);
+    if (!think) hy3_tokens_push(out, HY3_TOK_THINK_END);
+}
+
 
 static int utf8_decode(const uint8_t *s, size_t n, uint32_t *cp) {
     if (n == 0) return 0;

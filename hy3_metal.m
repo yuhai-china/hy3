@@ -74,6 +74,7 @@ typedef struct {
 
     id<MTLComputePipelineState> pipe_rms_norm;
     id<MTLComputePipelineState> pipe_rms_norm_offset;
+    id<MTLComputePipelineState> pipe_rms_norm_heads;
     id<MTLComputePipelineState> pipe_silu_mul;
     id<MTLComputePipelineState> pipe_sigmoid;
     id<MTLComputePipelineState> pipe_add;
@@ -86,13 +87,22 @@ typedef struct {
     id<MTLComputePipelineState> pipe_matmul_f32;
     id<MTLComputePipelineState> pipe_matmul_f16;
     id<MTLComputePipelineState> pipe_matmul_q8_0;
+    id<MTLComputePipelineState> pipe_matmul_q8_0_mm;
     id<MTLComputePipelineState> pipe_matmul_q4_k;
+    id<MTLComputePipelineState> pipe_matmul_q4_k_mm;
     id<MTLComputePipelineState> pipe_kv_cache_write;
     id<MTLComputePipelineState> pipe_touch;
+
+    /* Fast MoE path pipelines. */
+    id<MTLComputePipelineState> pipe_router_topk;
+    id<MTLComputePipelineState> pipe_matmul_q4_k_id;
+    id<MTLComputePipelineState> pipe_moe_swiglu_id;
+    id<MTLComputePipelineState> pipe_moe_combine_id;
 
     hy3_metal_view_t views[HY3_METAL_MAX_VIEWS];
     int n_views;
     uint64_t max_tensor_bytes;
+    id residency_set;   /* MTLResidencySet (macOS 15+); nil if unavailable/disabled */
 
     /* Mutable per-token working buffers (all MTLResourceStorageModeShared,
      * i.e. directly readable/writable from the CPU once the command buffer
@@ -113,9 +123,20 @@ typedef struct {
     id<MTLBuffer> d_expert_out;  /* HY3_N_EMBD accumulator across routed experts */
     id<MTLBuffer> d_logits;      /* HY3_N_VOCAB */
 
+    /* Fast MoE path (ds4-style, GPU-resident routing). */
+    id<MTLBuffer> d_router_ids;  /* HY3_N_EXPERT_USED int32 expert ids */
+    id<MTLBuffer> d_router_wts;  /* HY3_N_EXPERT_USED float combine weights */
+    id<MTLBuffer> d_bias;        /* HY3_N_LAYER * HY3_N_EXPERT float expert bias (all layers, uploaded once) */
+    id<MTLBuffer> d_gate_k;      /* HY3_N_EXPERT_USED * HY3_MOE_INTERMED */
+    id<MTLBuffer> d_up_k;        /* HY3_N_EXPERT_USED * HY3_MOE_INTERMED */
+    id<MTLBuffer> d_mid_k;       /* HY3_N_EXPERT_USED * HY3_MOE_INTERMED */
+    id<MTLBuffer> d_down_k;      /* HY3_N_EXPERT_USED * HY3_N_EMBD */
+
     id<MTLBuffer> d_k_cache;
     id<MTLBuffer> d_v_cache;
     int ctx_cap_slots; /* capacity of d_k_cache/d_v_cache in interleaved slots */
+    int concurrent;    /* 1 = concurrent encoder; helpers skip auto barriers and
+                        * the caller inserts explicit barriers at dependency edges */
 } hy3_metal_ctx_t;
 
 /* =========================================================================
@@ -123,6 +144,43 @@ typedef struct {
  * ========================================================================= */
 
 static uint64_t hy3_round_up(uint64_t v, uint64_t align) { return (v + align - 1) & ~(align - 1); }
+
+static double hy3_metal_now(void);
+
+/* Pin every wrapped model view into a single MTLResidencySet so the driver
+ * establishes residency for the whole model at load time rather than faulting
+ * it in lazily on the first inference token. No-op on macOS < 15 or when
+ * HY3_METAL_RESIDENCY=0. */
+static void hy3_metal_request_residency(hy3_metal_ctx_t *ctx) {
+    const char *env = getenv("HY3_METAL_RESIDENCY");
+    if (env && env[0] == '0') {
+        fprintf(stderr, "hy3_metal: residency set disabled (HY3_METAL_RESIDENCY=0)\n");
+        return;
+    }
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"hy3_model";
+        desc.initialCapacity = ctx->n_views;
+        NSError *err = nil;
+        id<MTLResidencySet> set = [ctx->device newResidencySetWithDescriptor:desc error:&err];
+        if (!set) {
+            fprintf(stderr, "hy3_metal: residency set creation failed: %s (falling back to demand paging)\n",
+                    err ? err.localizedDescription.UTF8String : "unknown");
+            return;
+        }
+        for (int i = 0; i < ctx->n_views; i++)
+            [set addAllocation:ctx->views[i].buffer];
+        [set commit];
+        double t0 = hy3_metal_now();
+        [set requestResidency];
+        [ctx->queue addResidencySet:set];
+        ctx->residency_set = set;
+        fprintf(stderr, "hy3_metal: requested residency for %d view(s) in %.2fs\n",
+                ctx->n_views, hy3_metal_now() - t0);
+    } else {
+        fprintf(stderr, "hy3_metal: MTLResidencySet needs macOS 15+; using demand paging\n");
+    }
+}
 
 static bool hy3_metal_wrap_model(hy3_metal_ctx_t *ctx, hy3_model *m) {
     uint64_t page = (uint64_t)getpagesize();
@@ -145,10 +203,34 @@ static bool hy3_metal_wrap_model(hy3_metal_ctx_t *ctx, hy3_model *m) {
         return false;
     }
 
-    uint64_t overlap = hy3_round_up(max_tensor_bytes, page) + page;
+    /* Overlap must cover not just the largest single tensor but the largest
+     * *contiguous expert block* (all 192 experts of one projection), because
+     * the fast MoE id-kernel indexes experts as base + id*stride and needs the
+     * whole block inside one view. The gate/up experts are interleaved so a
+     * gate block spans ~2x its own bytes; use the observed max block span. */
+    uint64_t max_expert_span = 0;
+    for (int il = HY3_N_LAYER_DENSE; il < HY3_N_LAYER; il++) {
+        hy3_layer_weights *l = &m->w.layers[il];
+        if (!l->ffn_gate_exps[0].t || !l->ffn_gate_exps[HY3_N_EXPERT-1].t) continue;
+        struct {
+            const hy3_weight *lo, *hi;
+        } blocks[3] = {
+            { &l->ffn_gate_exps[0], &l->ffn_gate_exps[HY3_N_EXPERT-1] },
+            { &l->ffn_up_exps[0],   &l->ffn_up_exps[HY3_N_EXPERT-1] },
+            { &l->ffn_down_exps[0], &l->ffn_down_exps[HY3_N_EXPERT-1] },
+        };
+        for (int b = 0; b < 3; b++) {
+            if (!blocks[b].lo->t || !blocks[b].hi->t) continue;
+            uint64_t span = blocks[b].hi->t->abs_offset + blocks[b].hi->t->bytes
+                          - blocks[b].lo->t->abs_offset;
+            if (span > max_expert_span) max_expert_span = span;
+        }
+    }
+    uint64_t overlap_bytes = max_tensor_bytes > max_expert_span ? max_tensor_bytes : max_expert_span;
+    uint64_t overlap = hy3_round_up(overlap_bytes, page) + page;
     if (max_buffer <= overlap) {
-        fprintf(stderr, "hy3_metal: maxBufferLength (%.2f GiB) too small for the largest tensor (%.2f GiB)\n",
-                (double)max_buffer / 1e9, (double)max_tensor_bytes / 1e9);
+        fprintf(stderr, "hy3_metal: maxBufferLength (%.2f GiB) too small for the largest expert block (%.2f GiB)\n",
+                (double)max_buffer / 1e9, (double)overlap_bytes / 1e9);
         return false;
     }
 
@@ -182,6 +264,17 @@ static bool hy3_metal_wrap_model(hy3_metal_ctx_t *ctx, hy3_model *m) {
     }
     fprintf(stderr, "hy3_metal: wrapped %.2f GiB model into %d zero-copy view(s) (largest tensor %.2f MiB)\n",
             (double)m->gguf.size / 1e9, ctx->n_views, (double)max_tensor_bytes / 1e6);
+
+    /* Pin all model views with an MTLResidencySet (macOS 15+). This lets the
+     * driver build the GPU page tables / do VM validation and residency
+     * accounting for the whole ~174GiB model up front, during load, instead of
+     * lazily on the first inference token -- which is what made the first
+     * prompt token pay a ~70s cold-start stall. Gated by HY3_METAL_RESIDENCY
+     * (default on): set it to 0 to fall back to plain demand paging if a driver
+     * ever serves zero for a pinned no-copy view (an old bug this used to hit
+     * with a single giant overlapping view; the per-view set below is what ds4
+     * uses successfully). */
+    hy3_metal_request_residency(ctx);
     return true;
 }
 
@@ -313,6 +406,7 @@ static void m_rms_norm(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
     if (!hy3_bind_weight(enc, ctx, w, 2)) exit(1);
     [enc setBytes:&n length:sizeof(n) atIndex:3];
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 /* In-place per-head RMS norm: buf[off..off+n) is normalized using shared
@@ -325,6 +419,20 @@ static void m_rms_norm_offset(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder>
     [enc setBytes:&n length:sizeof(n) atIndex:2];
     [enc setBytes:&off length:sizeof(off) atIndex:3];
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+/* Fused per-head RMS norm: normalizes n_heads heads of head_dim each in a
+ * single dispatch (grid.x = n_heads). Replaces the per-head loop. */
+static void m_rms_norm_heads(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
+                             id<MTLBuffer> buf, const hy3_weight *w,
+                             uint32_t head_dim, uint32_t n_heads) {
+    [enc setComputePipelineState:ctx->pipe_rms_norm_heads];
+    [enc setBuffer:buf offset:0 atIndex:0];
+    if (!hy3_bind_weight(enc, ctx, w, 1)) exit(1);
+    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 static void m_mul_mat(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
@@ -335,11 +443,42 @@ static void m_mul_mat(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
         exit(1);
     }
     id<MTLComputePipelineState> pipe = nil;
+    bool q4k_mm = false;
+    bool q8_mm = false;
     switch (w->t->ggml_type) {
         case 0:  pipe = ctx->pipe_matmul_f32;  break;
         case 1:  pipe = ctx->pipe_matmul_f16;  break;
-        case 8:  pipe = ctx->pipe_matmul_q8_0; break;
-        case 12: pipe = ctx->pipe_matmul_q4_k; break;
+        case 8:
+            /* SIMD-group q8_0 variant requires m_rows % 4 == 0 and
+             * n_cols % 32 == 0. Gated by HY3_Q8_MM (default on). */
+            if ((m_rows % 4) == 0 && (n_cols % 32) == 0) {
+                static int use_mm = -1;
+                if (use_mm < 0) {
+                    const char *e = getenv("HY3_Q8_MM");
+                    use_mm = (!e || e[0] != '0');
+                }
+                if (use_mm) { pipe = ctx->pipe_matmul_q8_0_mm; q8_mm = true; }
+                else        { pipe = ctx->pipe_matmul_q8_0; }
+            } else {
+                pipe = ctx->pipe_matmul_q8_0;
+            }
+            break;
+        case 12:
+            /* SIMD-group q4_k variant requires m_rows % 4 == 0 and
+             * n_cols % 256 == 0; every q4_k weight in this model satisfies
+             * both. Gated by HY3_Q4K_MM (default on) for easy A/B profiling. */
+            if ((m_rows % 4) == 0 && (n_cols % 256) == 0) {
+                static int use_mm = -1;
+                if (use_mm < 0) {
+                    const char *e = getenv("HY3_Q4K_MM");
+                    use_mm = (!e || e[0] != '0');
+                }
+                if (use_mm) { pipe = ctx->pipe_matmul_q4_k_mm; q4k_mm = true; }
+                else        { pipe = ctx->pipe_matmul_q4_k; }
+            } else {
+                pipe = ctx->pipe_matmul_q4_k;
+            }
+            break;
         default:
             fprintf(stderr, "hy3_metal: unsupported ggml_type %u for matmul\n", w->t->ggml_type);
             exit(1);
@@ -349,7 +488,12 @@ static void m_mul_mat(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
     if (!hy3_bind_weight(enc, ctx, w, 1)) exit(1);
     [enc setBuffer:x offset:0 atIndex:2];
     [enc setBytes:&n_cols length:sizeof(n_cols) atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(m_rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    if (q4k_mm || q8_mm) {
+        [enc dispatchThreadgroups:MTLSizeMake(m_rows / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    } else {
+        [enc dispatchThreadgroups:MTLSizeMake(m_rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 static void m_silu_mul(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
@@ -361,6 +505,7 @@ static void m_silu_mul(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
     [enc setBytes:&n length:sizeof(n) atIndex:3];
     NSUInteger tg = 256;
     [enc dispatchThreadgroups:MTLSizeMake((n + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 static void m_add(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
@@ -371,6 +516,7 @@ static void m_add(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
     [enc setBytes:&n length:sizeof(n) atIndex:2];
     NSUInteger tg = 256;
     [enc dispatchThreadgroups:MTLSizeMake((n + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 static void m_scale_add(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
@@ -382,6 +528,7 @@ static void m_scale_add(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
     [enc setBytes:&n length:sizeof(n) atIndex:3];
     NSUInteger tg = 256;
     [enc dispatchThreadgroups:MTLSizeMake((n + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 static void m_fill_zero(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc, id<MTLBuffer> buf, uint32_t n) {
@@ -390,6 +537,7 @@ static void m_fill_zero(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc, 
     [enc setBytes:&n length:sizeof(n) atIndex:1];
     NSUInteger tg = 256;
     [enc dispatchThreadgroups:MTLSizeMake((n + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 static void m_rope(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
@@ -405,6 +553,7 @@ static void m_rope(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
     uint32_t total = (n_heads + n_kv_heads) * (head_dim / 2);
     NSUInteger tg = 256;
     [enc dispatchThreadgroups:MTLSizeMake((total + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 static void m_kv_cache_write(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
@@ -419,6 +568,7 @@ static void m_kv_cache_write(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> 
     [enc setBytes:&slot_u length:sizeof(slot_u) atIndex:5];
     NSUInteger tg = 256;
     [enc dispatchThreadgroups:MTLSizeMake((kv_size + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 static void m_attention(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
@@ -439,6 +589,7 @@ static void m_attention(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
     [enc setBytes:&n_layers length:sizeof(n_layers) atIndex:10];
     [enc setThreadgroupMemoryLength:8192 * sizeof(float) atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 /* =========================================================================
@@ -482,6 +633,7 @@ int hy3_metal_init(hy3_model *m) {
 
     ctx->pipe_rms_norm        = hy3_make_pipeline(ctx->device, ctx->library, "rms_norm");
     ctx->pipe_rms_norm_offset = hy3_make_pipeline(ctx->device, ctx->library, "rms_norm_offset");
+    ctx->pipe_rms_norm_heads  = hy3_make_pipeline(ctx->device, ctx->library, "rms_norm_heads");
     ctx->pipe_silu_mul        = hy3_make_pipeline(ctx->device, ctx->library, "silu_mul");
     ctx->pipe_sigmoid         = hy3_make_pipeline(ctx->device, ctx->library, "sigmoid_inplace");
     ctx->pipe_add             = hy3_make_pipeline(ctx->device, ctx->library, "add_inplace");
@@ -494,9 +646,15 @@ int hy3_metal_init(hy3_model *m) {
     ctx->pipe_matmul_f32      = hy3_make_pipeline(ctx->device, ctx->library, "matmul_f32");
     ctx->pipe_matmul_f16      = hy3_make_pipeline(ctx->device, ctx->library, "matmul_f16");
     ctx->pipe_matmul_q8_0     = hy3_make_pipeline(ctx->device, ctx->library, "matmul_q8_0");
+    ctx->pipe_matmul_q8_0_mm  = hy3_make_pipeline(ctx->device, ctx->library, "matmul_q8_0_mm");
     ctx->pipe_matmul_q4_k     = hy3_make_pipeline(ctx->device, ctx->library, "matmul_q4_k");
+    ctx->pipe_matmul_q4_k_mm  = hy3_make_pipeline(ctx->device, ctx->library, "matmul_q4_k_mm");
     ctx->pipe_kv_cache_write  = hy3_make_pipeline(ctx->device, ctx->library, "kv_cache_write");
     ctx->pipe_touch           = hy3_make_pipeline(ctx->device, ctx->library, "touch_u8_stride");
+    ctx->pipe_router_topk     = hy3_make_pipeline(ctx->device, ctx->library, "router_topk");
+    ctx->pipe_matmul_q4_k_id  = hy3_make_pipeline(ctx->device, ctx->library, "matmul_q4_k_id");
+    ctx->pipe_moe_swiglu_id   = hy3_make_pipeline(ctx->device, ctx->library, "moe_swiglu_id");
+    ctx->pipe_moe_combine_id  = hy3_make_pipeline(ctx->device, ctx->library, "moe_combine_id");
 
     if (!hy3_metal_wrap_model(ctx, m)) {
         free(ctx);
@@ -521,6 +679,27 @@ int hy3_metal_init(hy3_model *m) {
     ctx->d_expert_out = hy3_alloc(ctx->device, HY3_N_EMBD);
     ctx->d_logits     = hy3_alloc(ctx->device, HY3_N_VOCAB);
 
+    /* Fast MoE path buffers. */
+    ctx->d_router_ids = hy3_alloc(ctx->device, HY3_N_EXPERT_USED);           /* int32 reuses float size */
+    ctx->d_router_wts = hy3_alloc(ctx->device, HY3_N_EXPERT_USED);
+    ctx->d_bias       = hy3_alloc(ctx->device, (uint64_t)HY3_N_LAYER * HY3_N_EXPERT);
+    ctx->d_gate_k     = hy3_alloc(ctx->device, (uint64_t)HY3_N_EXPERT_USED * HY3_MOE_INTERMED);
+    ctx->d_up_k       = hy3_alloc(ctx->device, (uint64_t)HY3_N_EXPERT_USED * HY3_MOE_INTERMED);
+    ctx->d_mid_k      = hy3_alloc(ctx->device, (uint64_t)HY3_N_EXPERT_USED * HY3_MOE_INTERMED);
+    ctx->d_down_k     = hy3_alloc(ctx->device, (uint64_t)HY3_N_EXPERT_USED * HY3_N_EMBD);
+
+    /* Upload every layer's expert bias once (static). Layers without a bias
+     * tensor get zeros. The fast MoE router reads bias at offset il*NE. */
+    {
+        float *bp = (float *)ctx->d_bias.contents;
+        memset(bp, 0, (size_t)HY3_N_LAYER * HY3_N_EXPERT * sizeof(float));
+        for (int il = 0; il < HY3_N_LAYER; il++) {
+            hy3_layer_weights *l = &m->w.layers[il];
+            if (l->has_expert_bias)
+                memcpy(bp + (size_t)il * HY3_N_EXPERT, l->expert_bias, HY3_N_EXPERT * sizeof(float));
+        }
+    }
+
     /* KV cache: interleaved by layer (slot = token*HY3_N_LAYER + layer),
      * same layout as the CPU/CUDA backends. Default to 8192 tokens of
      * context; grows on demand in hy3_eval_metal (see gpu_ensure_kv_capacity
@@ -541,6 +720,17 @@ int hy3_metal_init(hy3_model *m) {
 
     m->metal_ctx = ctx;
     fprintf(stderr, "hy3_metal: initialized, all %d layers Metal-resident (zero-copy)\n", HY3_N_LAYER);
+    if (getenv("HY3_METAL_SELFTEST")) {
+        for (int i = 0; i < HY3_N_EMBD; i++) ((float *)ctx->d_s.contents)[i] = 1.0f;
+        hy3_layer_weights *l0 = &m->w.layers[0];
+        const float *wc = (const float *)l0->attn_norm.data;
+        double cs = 0; for (int i = 0; i < HY3_N_EMBD; i++) cs += wc[i];
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        m_mul_mat(ctx, enc, &l0->attn_norm, ctx->d_logits, ctx->d_s, 1, HY3_N_EMBD);
+        [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        fprintf(stderr, "hy3_metal: SELFTEST L0 dot=%.4f CPU=%.4f\n", ((float *)ctx->d_logits.contents)[0], cs);
+    }
     return 0;
 }
 
@@ -567,6 +757,14 @@ void hy3_metal_free(hy3_model *m) {
      * out of scope; explicitly nil the zero-copy view buffers first so
      * Metal drops its reference to the mmap'd pages before hy3_model_free()
      * calls munmap() on the underlying file. */
+    if (ctx->residency_set) {
+        if (@available(macOS 15.0, *)) {
+            id<MTLResidencySet> set = ctx->residency_set;
+            [ctx->queue removeResidencySet:set];
+            [set endResidency];
+        }
+        ctx->residency_set = nil;
+    }
     for (int i = 0; i < ctx->n_views; i++) ctx->views[i].buffer = nil;
     ctx->n_views = 0;
     free(ctx);
@@ -678,30 +876,31 @@ static void metal_forward_layer(hy3_metal_ctx_t *ctx, hy3_model *m, int il, int 
 
     int topk_inds[HY3_N_EXPERT_USED];
     float topk_vals[HY3_N_EXPERT_USED];
+    int n_used = m->n_expert_used;
     {
         int idx[HY3_N_EXPERT];
         float val[HY3_N_EXPERT];
         for (int i = 0; i < HY3_N_EXPERT; i++) { idx[i] = i; val[i] = scored[i]; }
-        for (int i = 0; i < HY3_N_EXPERT_USED; i++) {
+        for (int i = 0; i < n_used; i++) {
             int best = i;
             for (int j = i + 1; j < HY3_N_EXPERT; j++) if (val[j] > val[best]) best = j;
             float tv = val[i]; val[i] = val[best]; val[best] = tv;
             int ti = idx[i]; idx[i] = idx[best]; idx[best] = ti;
         }
         float sum_w = 0.0f;
-        for (int i = 0; i < HY3_N_EXPERT_USED; i++) {
+        for (int i = 0; i < n_used; i++) {
             topk_inds[i] = idx[i];
             topk_vals[i] = sigmoid_vals[idx[i]];
             sum_w += topk_vals[i];
         }
         float inv_sum = 1.0f / (sum_w + 1e-20f);
         const float router_scaling = 2.826f;
-        for (int i = 0; i < HY3_N_EXPERT_USED; i++) topk_vals[i] = topk_vals[i] * inv_sum * router_scaling;
+        for (int i = 0; i < n_used; i++) topk_vals[i] = topk_vals[i] * inv_sum * router_scaling;
     }
 
     id<MTLCommandBuffer> cb2 = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc2 = [cb2 computeCommandEncoder];
-    for (int e = 0; e < HY3_N_EXPERT_USED; e++) {
+    for (int e = 0; e < n_used; e++) {
         int ei = topk_inds[e];
         m_mul_mat(ctx, enc2, &l->ffn_gate_exps[ei], ctx->d_gate, ctx->d_s, HY3_MOE_INTERMED, HY3_N_EMBD);
         m_mul_mat(ctx, enc2, &l->ffn_up_exps[ei], ctx->d_up, ctx->d_s, HY3_MOE_INTERMED, HY3_N_EMBD);
@@ -714,6 +913,227 @@ static void metal_forward_layer(hy3_metal_ctx_t *ctx, hy3_model *m, int il, int 
     [enc2 endEncoding];
     [cb2 commit];
     [cb2 waitUntilCompleted];
+}
+
+/* ---------------------------------------------------------------------------
+ * FAST PATH: whole-token single-command-buffer forward with GPU-resident MoE
+ * routing (no per-layer commit/wait, no CPU round-trip for expert selection).
+ * Gated by HY3_FAST (default on). ds4-style batch encoder validated in
+ * fast_metal.m (2.4x fewer syncs).
+ * ------------------------------------------------------------------------- */
+
+static void metal_encode_attention(hy3_metal_ctx_t *ctx, hy3_model *m, int il, int pos,
+                                   id<MTLComputeCommandEncoder> enc) {
+    hy3_layer_weights *l = &m->w.layers[il];
+    uint32_t q_size = HY3_N_HEAD * HY3_HEAD_DIM;
+    uint32_t kv_size = HY3_N_KV_HEAD * HY3_HEAD_DIM;
+    int kv_len = m->cache_len;
+    #define BAR() do { if (ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; } while(0)
+
+    m_rms_norm(ctx, enc, ctx->d_s, ctx->d_embed, &l->attn_norm, HY3_N_EMBD);
+    BAR();  /* d_s ready before q/k/v read it */
+    /* q,k,v are independent (write disjoint buffers, read d_s) -> run concurrently */
+    m_mul_mat(ctx, enc, &l->attn_q, ctx->d_q, ctx->d_s, q_size, HY3_N_EMBD);
+    m_mul_mat(ctx, enc, &l->attn_k, ctx->d_k, ctx->d_s, kv_size, HY3_N_EMBD);
+    m_mul_mat(ctx, enc, &l->attn_v, ctx->d_v, ctx->d_s, kv_size, HY3_N_EMBD);
+    BAR();  /* q,k,v ready before norm/rope */
+    if (l->attn_q_norm.data)
+        m_rms_norm_heads(ctx, enc, ctx->d_q, &l->attn_q_norm, HY3_HEAD_DIM, HY3_N_HEAD);
+    if (l->attn_k_norm.data)
+        m_rms_norm_heads(ctx, enc, ctx->d_k, &l->attn_k_norm, HY3_HEAD_DIM, HY3_N_KV_HEAD);
+    BAR();  /* q/k norm before rope */
+    m_rope(ctx, enc, ctx->d_q, ctx->d_k, pos, HY3_HEAD_DIM, HY3_N_HEAD, HY3_N_KV_HEAD);
+    BAR();  /* rope before kv write + attention read q */
+    m_kv_cache_write(ctx, enc, kv_len, kv_size);
+    m->cache_len = kv_len + 1;
+    BAR();  /* kv written before attention reads cache */
+    m_attention(ctx, enc, ctx->d_attn_out, ctx->d_q,
+                HY3_N_HEAD, HY3_N_KV_HEAD, HY3_HEAD_DIM,
+                m->cache_len, HY3_N_HEAD / HY3_N_KV_HEAD, il, HY3_N_LAYER);
+    BAR();  /* attn_out before o proj */
+    m_mul_mat(ctx, enc, &l->attn_output, ctx->d_o_proj, ctx->d_attn_out, HY3_N_EMBD, q_size);
+    BAR();  /* o_proj before residual add */
+    m_add(ctx, enc, ctx->d_embed, ctx->d_o_proj, HY3_N_EMBD);
+    BAR();  /* embed updated before next stage */
+    #undef BAR
+}
+
+/* Id-matmul over the contiguous expert weight block: computes all `k` selected
+ * experts in one dispatch. `base` is expert 0's tensor; experts are equal-stride. */
+static void m_mul_mat_id(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
+                         const hy3_weight *base, uint64_t expert_stride,
+                         id<MTLBuffer> dst, id<MTLBuffer> x,
+                         uint32_t m_rows, uint32_t n_cols, uint32_t k,
+                         uint32_t x_per_slot) {
+    id<MTLBuffer> buf; uint64_t off;
+    /* The id-kernel indexes experts as base + id*stride, so the WHOLE expert
+     * block (up to the highest selected id) must live in one view. Validate the
+     * full span, not just expert 0's tensor, or a block straddling a view
+     * boundary would index into invalid pages (NaN/garbage). Use the full
+     * 192-expert span to be safe. */
+    uint64_t full_span = expert_stride * (uint64_t)(HY3_N_EXPERT - 1) + base->t->bytes;
+    if (!hy3_metal_find_view(ctx, base->t->abs_offset, full_span, &buf, &off)) {
+        fprintf(stderr, "hy3_metal: expert block (span %.2f GiB) crosses a view boundary\n",
+                (double)full_span / 1e9);
+        exit(1);
+    }
+    uint32_t stride32 = (uint32_t)expert_stride;
+    [enc setComputePipelineState:ctx->pipe_matmul_q4_k_id];
+    [enc setBuffer:dst offset:0 atIndex:0];
+    [enc setBuffer:buf offset:(NSUInteger)off atIndex:1];
+    [enc setBuffer:x offset:0 atIndex:2];
+    [enc setBytes:&n_cols length:4 atIndex:3];
+    [enc setBytes:&m_rows length:4 atIndex:4];
+    [enc setBytes:&stride32 length:4 atIndex:5];
+    [enc setBuffer:ctx->d_router_ids offset:0 atIndex:6];
+    [enc setBytes:&x_per_slot length:4 atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake(m_rows / 4, k, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+static void metal_encode_moe(hy3_metal_ctx_t *ctx, hy3_model *m, int il,
+                             id<MTLComputeCommandEncoder> enc) {
+    hy3_layer_weights *l = &m->w.layers[il];
+    uint32_t k = (uint32_t)m->n_expert_used;
+    #define BAR() do { if (ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; } while(0)
+
+    m_rms_norm(ctx, enc, ctx->d_s, ctx->d_embed, &l->ffn_norm, HY3_N_EMBD);
+    BAR();  /* d_s ready */
+
+    m_mul_mat(ctx, enc, &l->ffn_gate_inp, ctx->d_router, ctx->d_s, HY3_N_EXPERT, HY3_N_EMBD);
+    BAR();  /* router logits ready before top-k */
+    {
+        uint32_t NE = HY3_N_EXPERT, has_bias = l->has_expert_bias ? 1u : 0u;
+        float scaling = 2.826f;
+        [enc setComputePipelineState:ctx->pipe_router_topk];
+        [enc setBuffer:ctx->d_router offset:0 atIndex:0];
+        [enc setBuffer:ctx->d_bias offset:(NSUInteger)il * HY3_N_EXPERT * sizeof(float) atIndex:1];
+        [enc setBuffer:ctx->d_router_ids offset:0 atIndex:2];
+        [enc setBuffer:ctx->d_router_wts offset:0 atIndex:3];
+        [enc setBytes:&NE length:4 atIndex:4];
+        [enc setBytes:&k length:4 atIndex:5];
+        [enc setBytes:&has_bias length:4 atIndex:6];
+        [enc setBytes:&scaling length:4 atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+    BAR();  /* router_ids/wts ready before routed matmuls; also gates shexp */
+
+    uint64_t gate_stride = l->ffn_gate_exps[1].t->abs_offset - l->ffn_gate_exps[0].t->abs_offset;
+    uint64_t up_stride   = l->ffn_up_exps[1].t->abs_offset   - l->ffn_up_exps[0].t->abs_offset;
+    uint64_t down_stride = l->ffn_down_exps[1].t->abs_offset - l->ffn_down_exps[0].t->abs_offset;
+
+    /* Shared + routed gate/up all read d_s and write disjoint buffers -> concurrent. */
+    m_mul_mat(ctx, enc, &l->ffn_gate_shexp, ctx->d_gate, ctx->d_s, HY3_MOE_INTERMED, HY3_N_EMBD);
+    m_mul_mat(ctx, enc, &l->ffn_up_shexp, ctx->d_up, ctx->d_s, HY3_MOE_INTERMED, HY3_N_EMBD);
+    m_mul_mat_id(ctx, enc, &l->ffn_gate_exps[0], gate_stride, ctx->d_gate_k, ctx->d_s,
+                 HY3_MOE_INTERMED, HY3_N_EMBD, k, 0);
+    m_mul_mat_id(ctx, enc, &l->ffn_up_exps[0], up_stride, ctx->d_up_k, ctx->d_s,
+                 HY3_MOE_INTERMED, HY3_N_EMBD, k, 0);
+    BAR();  /* gate/up (shared+routed) ready before swiglu */
+
+    /* Shared silu*up and routed swiglu write disjoint buffers -> concurrent. */
+    m_silu_mul(ctx, enc, ctx->d_mid, ctx->d_gate, ctx->d_up, HY3_MOE_INTERMED);
+    {
+        uint32_t total = k * HY3_MOE_INTERMED, tg = 256;
+        [enc setComputePipelineState:ctx->pipe_moe_swiglu_id];
+        [enc setBuffer:ctx->d_mid_k offset:0 atIndex:0];
+        [enc setBuffer:ctx->d_gate_k offset:0 atIndex:1];
+        [enc setBuffer:ctx->d_up_k offset:0 atIndex:2];
+        [enc setBytes:&total length:4 atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((total + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+    BAR();  /* mid (shared+routed) ready before down */
+
+    /* Shared down + routed down write disjoint buffers -> concurrent. */
+    m_mul_mat(ctx, enc, &l->ffn_down_shexp, ctx->d_ffn_out, ctx->d_mid, HY3_N_EMBD, HY3_MOE_INTERMED);
+    m_mul_mat_id(ctx, enc, &l->ffn_down_exps[0], down_stride, ctx->d_down_k, ctx->d_mid_k,
+                 HY3_N_EMBD, HY3_MOE_INTERMED, k, 1);
+    BAR();  /* down outputs ready before combine into residual */
+
+    m_add(ctx, enc, ctx->d_embed, ctx->d_ffn_out, HY3_N_EMBD);
+    BAR();  /* shared added before routed combine (both write d_embed) */
+    {
+        uint32_t M = HY3_N_EMBD, tg = 256;
+        [enc setComputePipelineState:ctx->pipe_moe_combine_id];
+        [enc setBuffer:ctx->d_embed offset:0 atIndex:0];
+        [enc setBuffer:ctx->d_down_k offset:0 atIndex:1];
+        [enc setBuffer:ctx->d_router_wts offset:0 atIndex:2];
+        [enc setBytes:&M length:4 atIndex:3];
+        [enc setBytes:&k length:4 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((M + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+    BAR();  /* embed updated before next layer */
+    #undef BAR
+}
+
+static void metal_encode_dense(hy3_metal_ctx_t *ctx, hy3_model *m, int il,
+                               id<MTLComputeCommandEncoder> enc) {
+    hy3_layer_weights *l = &m->w.layers[il];
+    #define BAR() do { if (ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; } while(0)
+    m_rms_norm(ctx, enc, ctx->d_s, ctx->d_embed, &l->ffn_norm, HY3_N_EMBD);
+    BAR();
+    m_mul_mat(ctx, enc, &l->ffn_gate, ctx->d_gate, ctx->d_s, HY3_DENSE_INTERMED, HY3_N_EMBD);
+    m_mul_mat(ctx, enc, &l->ffn_up, ctx->d_up, ctx->d_s, HY3_DENSE_INTERMED, HY3_N_EMBD);
+    BAR();
+    m_silu_mul(ctx, enc, ctx->d_mid, ctx->d_gate, ctx->d_up, HY3_DENSE_INTERMED);
+    BAR();
+    m_mul_mat(ctx, enc, &l->ffn_down, ctx->d_ffn_out, ctx->d_mid, HY3_N_EMBD, HY3_DENSE_INTERMED);
+    BAR();
+    m_add(ctx, enc, ctx->d_embed, ctx->d_ffn_out, HY3_N_EMBD);
+    BAR();
+    #undef BAR
+}
+
+static void metal_forward_model_fast(hy3_metal_ctx_t *ctx, hy3_model *m, int token, int want_logits) {
+    static int concurrent = -1;
+    if (concurrent < 0) {
+        const char *e = getenv("HY3_CONCURRENT");
+        concurrent = (!e || e[0] != '0');   /* default on */
+    }
+    ctx->concurrent = concurrent;
+
+    id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = concurrent
+        ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
+        : [cb computeCommandEncoder];
+
+    if (m->w.token_embd.t->ggml_type == 1)
+        [enc setComputePipelineState:ctx->pipe_embed_f16];
+    else
+        [enc setComputePipelineState:ctx->pipe_embed_f32];
+    [enc setBuffer:ctx->d_embed offset:0 atIndex:0];
+    if (!hy3_bind_weight(enc, ctx, &m->w.token_embd, 1)) exit(1);
+    uint32_t token_u = (uint32_t)token, dim = HY3_N_EMBD;
+    [enc setBytes:&token_u length:sizeof(token_u) atIndex:2];
+    [enc setBytes:&dim length:sizeof(dim) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((HY3_N_EMBD + 255) / 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    for (int il = 0; il < HY3_N_LAYER; il++) {
+        int pos = m->cache_len / HY3_N_LAYER;
+        metal_encode_attention(ctx, m, il, pos, enc);
+        if (il < HY3_N_LAYER_DENSE) {
+            metal_encode_dense(ctx, m, il, enc);
+        } else {
+            metal_encode_moe(ctx, m, il, enc);
+        }
+    }
+
+    /* Final norm + logits folded into the same command buffer (saves one
+     * commit/wait per generated token). */
+    if (want_logits) {
+        m_rms_norm(ctx, enc, ctx->d_embed, ctx->d_embed, &m->w.output_norm, HY3_N_EMBD);
+        if (ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        m_mul_mat(ctx, enc, &m->w.output, ctx->d_logits, ctx->d_embed, HY3_N_VOCAB, HY3_N_EMBD);
+    }
+
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    ctx->concurrent = 0;  /* restore for any serial path */
 }
 
 static void metal_forward_model(hy3_metal_ctx_t *ctx, hy3_model *m, int token) {
@@ -734,14 +1154,23 @@ static void metal_forward_model(hy3_metal_ctx_t *ctx, hy3_model *m, int token) {
     [cb commit];
     [cb waitUntilCompleted];
 
+    if (getenv("HY3_METAL_TRACE")) {
+        float *e = (float *)ctx->d_embed.contents;
+        fprintf(stderr, "TRACE after embed: %.4f %.4f %.4f %.4f\n", e[0], e[1], e[2], e[3]);
+    }
+
     for (int il = 0; il < HY3_N_LAYER; il++) {
         int pos = m->cache_len / HY3_N_LAYER;
         double lt0 = hy3_metal_now();
         metal_forward_layer(ctx, m, il, pos);
+        if (getenv("HY3_METAL_TRACE") && (il == 0 || il == 1 || il == 79)) {
+            float *e = (float *)ctx->d_embed.contents;
+            fprintf(stderr, "TRACE after layer %d: %.4f %.4f %.4f %.4f\n", il, e[0], e[1], e[2], e[3]);
+        }
         if (getenv("HY3_METAL_PROFILE")) {
             double dt = hy3_metal_now() - lt0;
-            fprintf(stderr, "hy3_metal: layer %d took %.3fs (%s)\n",
-                    il, dt, il < HY3_N_LAYER_DENSE ? "dense" : "moe");
+            fprintf(stderr, "hy3_metal: layer %d took %.3fms (%s)\n",
+                    il, dt * 1000.0, il < HY3_N_LAYER_DENSE ? "dense" : "moe");
         }
     }
 }
@@ -750,19 +1179,41 @@ int hy3_eval_metal(hy3_model *m, const hy3_tokens *tokens, float *logits, int *p
     hy3_metal_ctx_t *ctx = (hy3_metal_ctx_t *)m->metal_ctx;
     if (!ctx) return -1;
 
+    static int use_fast = -1;
+    if (use_fast < 0) {
+        const char *e = getenv("HY3_FAST");
+        use_fast = (!e || e[0] != '0');   /* default on */
+    }
+
     for (int i = 0; i < tokens->len; i++) {
         int token = tokens->v[i];
         hy3_metal_grow_kv_cache(ctx, m->cache_len + HY3_N_LAYER);
-        metal_forward_model(ctx, m, token);
+        if (use_fast) {
+            /* Only the last token needs logits; fold them into its cb. */
+            metal_forward_model_fast(ctx, m, token, i == tokens->len - 1);
+        } else {
+            metal_forward_model(ctx, m, token);
+        }
     }
 
-    id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    m_rms_norm(ctx, enc, ctx->d_embed, ctx->d_embed, &m->w.output_norm, HY3_N_EMBD);
-    m_mul_mat(ctx, enc, &m->w.output, ctx->d_logits, ctx->d_embed, HY3_N_VOCAB, HY3_N_EMBD);
-    [enc endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
+    if (!use_fast) {
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        m_rms_norm(ctx, enc, ctx->d_embed, ctx->d_embed, &m->w.output_norm, HY3_N_EMBD);
+        // DO NOT REMOVE: in-place norm then matmul read; barrier orders them.
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        m_mul_mat(ctx, enc, &m->w.output, ctx->d_logits, ctx->d_embed, HY3_N_VOCAB, HY3_N_EMBD);
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+
+    if (getenv("HY3_METAL_TRACE")) {
+        float *e = (float *)ctx->d_embed.contents;
+        float *g = (float *)ctx->d_logits.contents;
+        fprintf(stderr, "TRACE post-norm embed: %.4f %.4f %.4f | logits: %.4f %.4f %.4f\n",
+                e[0], e[1], e[2], g[0], g[1], g[2]);
+    }
 
     memcpy(logits, ctx->d_logits.contents, HY3_N_VOCAB * sizeof(float));
     *pos = m->cache_len;

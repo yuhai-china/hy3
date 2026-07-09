@@ -8,6 +8,10 @@
 /hy3-cli
 /hy3-convert
 /hy3_convert
+/fast_metal
+
+# Eval outputs
+/eval/*.json
 
 # Test binaries
 tests/hy3_test
