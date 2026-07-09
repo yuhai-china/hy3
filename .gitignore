@@ -15,6 +15,8 @@ tests/hy3_eval
 tests/hy3_eval_fast
 tests/hy3_eval_gpu
 tests/hy3_quick_check
+tests/hy3_diff
+*.dSYM
 
 # Models
 *.gguf

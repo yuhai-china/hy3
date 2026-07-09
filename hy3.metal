@@ -131,6 +131,24 @@ kernel void fill_zero(device float *x [[buffer(0)]],
     x[i] = 0.0f;
 }
 
+// Startup page-warming: read one byte per `stride` bytes across a model
+// view and accumulate into a scratch sink. Forces the GPU driver to fault
+// in / wire the mmap'd GGUF pages into GPU-accessible residency before
+// timed inference, so per-token latency isn't dominated by first-touch VM
+// faults on the zero-copy weight buffers. (Mirrors ds4_metal.m's
+// kernel_touch_u8_stride.)
+kernel void touch_u8_stride(device const uchar *data   [[buffer(0)]],
+                             device atomic_uint *sink   [[buffer(1)]],
+                             constant uint       &stride [[buffer(2)]],
+                             constant uint       &n_steps[[buffer(3)]],
+                             uint i [[thread_position_in_grid]])
+{
+    if (i >= n_steps) return;
+    uint acc = data[(size_t)i * stride];
+    if (acc == 0xFF)
+        atomic_fetch_add_explicit(sink, acc, memory_order_relaxed);
+}
+
 kernel void embed_lookup_f16(device float *out [[buffer(0)]],
                               device const half *table [[buffer(1)]],
                               constant uint &token [[buffer(2)]],
@@ -235,19 +253,47 @@ kernel void attention(device float       *out      [[buffer(0)]],
     if (ntok < 1) ntok = 1;
     if (ntok > 8192) ntok = 8192;
 
-    float max_score = -INFINITY;
-    for (int t = 0; t < ntok; t++) {
+    // Cooperatively compute the score vector into shared memory: each thread
+    // handles a strided subset of the timesteps. `scores` is threadgroup
+    // (shared) memory, so this MUST be split across threads with barriers --
+    // having every thread redundantly write the whole array (as the CUDA
+    // port's per-thread-local version did) races here and corrupts attention.
+    threadgroup float shared_max[128];
+    threadgroup float shared_sum[128];
+
+    float local_max = -INFINITY;
+    for (int t = (int)tid; t < ntok; t += (int)tgSz) {
         device const float *k_t = k_cache + (size_t)(t * n_layers + layer_id) * n_kv_heads * head_dim
                                            + (size_t)kv_h * head_dim;
         float s = 0.0f;
         for (uint d = 0; d < head_dim; d++) s += q_h[d] * k_t[d];
         s *= scale;
         scores[t] = s;
-        if (s > max_score) max_score = s;
+        if (s > local_max) local_max = s;
     }
-    float sum = 0.0f;
-    for (int t = 0; t < ntok; t++) { scores[t] = exp(scores[t] - max_score); sum += scores[t]; }
-    float inv = 1.0f / (sum + 1e-10f);
+    shared_max[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgSz / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_max[tid] = max(shared_max[tid], shared_max[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float max_score = shared_max[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_sum = 0.0f;
+    for (int t = (int)tid; t < ntok; t += (int)tgSz) {
+        float e = exp(scores[t] - max_score);
+        scores[t] = e;
+        local_sum += e;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgSz / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_sum[tid] += shared_sum[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0f / (shared_sum[0] + 1e-10f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     device float *out_h = out + (size_t)h * head_dim;
     for (uint d = tid; d < head_dim; d += tgSz) {

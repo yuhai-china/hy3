@@ -118,9 +118,6 @@ int main(int argc, char **argv) {
         hy3_tokens input;
         memset(&input, 0, sizeof(input));
         hy3_tokenize(model, prompt, &input);
-        fprintf(stderr, "hy3: prompt tokens (%d):", input.len);
-        for (int i = 0; i < input.len && i < 10; i++) fprintf(stderr, " %d", input.v[i]);
-        fprintf(stderr, "\n");
 
         hy3_generate(model, &input, n_predict, &params, emit_token, model);
         printf("\n");

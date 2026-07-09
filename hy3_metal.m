@@ -49,6 +49,7 @@ extern "C" {
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #ifndef HY3_METAL_SHADER_PATH
 #define HY3_METAL_SHADER_PATH "hy3.metal"
@@ -87,6 +88,7 @@ typedef struct {
     id<MTLComputePipelineState> pipe_matmul_q8_0;
     id<MTLComputePipelineState> pipe_matmul_q4_k;
     id<MTLComputePipelineState> pipe_kv_cache_write;
+    id<MTLComputePipelineState> pipe_touch;
 
     hy3_metal_view_t views[HY3_METAL_MAX_VIEWS];
     int n_views;
@@ -181,6 +183,48 @@ static bool hy3_metal_wrap_model(hy3_metal_ctx_t *ctx, hy3_model *m) {
     fprintf(stderr, "hy3_metal: wrapped %.2f GiB model into %d zero-copy view(s) (largest tensor %.2f MiB)\n",
             (double)m->gguf.size / 1e9, ctx->n_views, (double)max_tensor_bytes / 1e6);
     return true;
+}
+
+static double hy3_metal_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* Warm the mmap'd model into GPU-accessible residency by touching one byte
+ * per `stride` bytes of every view with a GPU kernel, so the first inference
+ * token doesn't pay the cost of faulting the zero-copy weight pages in.
+ * (Mirrors ds4_metal.m's kernel_touch_u8_stride approach.) */
+static void hy3_metal_warm_views(hy3_metal_ctx_t *ctx) {
+    const char *env = getenv("HY3_METAL_WARM");
+    if (!(env && env[0] == '1')) return;
+
+    uint32_t stride = 16384; /* one page (16KiB on Apple Silicon) */
+    id<MTLBuffer> sink = [ctx->device newBufferWithLength:sizeof(uint32_t)
+                                                  options:MTLResourceStorageModeShared];
+    if (!sink) return;
+
+    double t0 = hy3_metal_now();
+    for (int i = 0; i < ctx->n_views; i++) {
+        hy3_metal_view_t *v = &ctx->views[i];
+        uint32_t n_steps = (uint32_t)((v->length + stride - 1) / stride);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ctx->pipe_touch];
+        [enc setBuffer:v->buffer offset:0 atIndex:0];
+        [enc setBuffer:sink offset:0 atIndex:1];
+        [enc setBytes:&stride length:sizeof(stride) atIndex:2];
+        [enc setBytes:&n_steps length:sizeof(n_steps) atIndex:3];
+        NSUInteger tg = 256;
+        [enc dispatchThreadgroups:MTLSizeMake((n_steps + tg - 1) / tg, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+    fprintf(stderr, "hy3_metal: warmed %d view(s) into GPU residency in %.2fs\n",
+            ctx->n_views, hy3_metal_now() - t0);
 }
 
 static bool hy3_metal_find_view(hy3_metal_ctx_t *ctx, uint64_t abs_offset, uint64_t bytes,
@@ -452,11 +496,14 @@ int hy3_metal_init(hy3_model *m) {
     ctx->pipe_matmul_q8_0     = hy3_make_pipeline(ctx->device, ctx->library, "matmul_q8_0");
     ctx->pipe_matmul_q4_k     = hy3_make_pipeline(ctx->device, ctx->library, "matmul_q4_k");
     ctx->pipe_kv_cache_write  = hy3_make_pipeline(ctx->device, ctx->library, "kv_cache_write");
+    ctx->pipe_touch           = hy3_make_pipeline(ctx->device, ctx->library, "touch_u8_stride");
 
     if (!hy3_metal_wrap_model(ctx, m)) {
         free(ctx);
         return -1;
     }
+
+    hy3_metal_warm_views(ctx);
 
     uint32_t inter = HY3_DENSE_INTERMED > HY3_MOE_INTERMED ? HY3_DENSE_INTERMED : HY3_MOE_INTERMED;
     ctx->d_embed      = hy3_alloc(ctx->device, HY3_N_EMBD);
@@ -689,7 +736,13 @@ static void metal_forward_model(hy3_metal_ctx_t *ctx, hy3_model *m, int token) {
 
     for (int il = 0; il < HY3_N_LAYER; il++) {
         int pos = m->cache_len / HY3_N_LAYER;
+        double lt0 = hy3_metal_now();
         metal_forward_layer(ctx, m, il, pos);
+        if (getenv("HY3_METAL_PROFILE")) {
+            double dt = hy3_metal_now() - lt0;
+            fprintf(stderr, "hy3_metal: layer %d took %.3fs (%s)\n",
+                    il, dt, il < HY3_N_LAYER_DENSE ? "dense" : "moe");
+        }
     }
 }
 

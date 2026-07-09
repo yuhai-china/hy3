@@ -197,7 +197,7 @@ static const gguf_type_info gguf_types[] = {
     [3]  = {32,  20},
     [6]  = {32,  22},
     [7]  = {32,  24},
-    [8]  = {32,  34},
+    [8]  = {32,  36},  /* hy3's Q8_0: F32 scale (4) + 32xint8 = 36 bytes/block, NOT ggml's 34 */
     [9]  = {32,  40},
     [10] = {256, 84},
     [11] = {256, 110},
@@ -250,8 +250,6 @@ static void parse_metadata(hy3_gguf_model *m, hy3_cursor *c) {
         }
         if (!skip_value(c, kv->type, 0)) die(c->error);
     }
-    fprintf(stderr, "hy3: parse_metadata: n_kv=%llu c->pos=%llu\n", 
-            (unsigned long long)m->n_kv, (unsigned long long)c->pos);
 }
 
 static void parse_tensors(hy3_gguf_model *m, hy3_cursor *c) {
@@ -273,8 +271,6 @@ static void parse_tensors(hy3_gguf_model *m, hy3_cursor *c) {
         }
     }
     m->tensor_data_pos = align_up(c->pos, m->alignment);
-    fprintf(stderr, "hy3: parse_tensors: c->pos after tensor info=%llu, tensor_data_pos=%llu\n",
-            (unsigned long long)c->pos, (unsigned long long)m->tensor_data_pos);
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         hy3_tensor_info *t = &m->tensors[i];
         t->abs_offset = m->tensor_data_pos + t->rel_offset;
@@ -729,6 +725,30 @@ int hy3_model_load(hy3_model **out, const char *path, int n_threads) {
     void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map == MAP_FAILED) die_errno("cannot mmap model", path);
 
+    /* The Metal backend wraps this mmap as zero-copy MTLBuffers. If a page
+     * isn't resident when the GPU dereferences it, the GPU reads ZERO rather
+     * than faulting it in -- silently corrupting weights (observed: the
+     * output.weight matmul returned all-zero logits on the first token). We
+     * therefore force the whole model resident up front. mlock() would be
+     * ideal but macOS caps user-wired memory (vm.user_wire_limit) and it
+     * fails with EAGAIN near the cap; a plain CPU read-touch of every page is
+     * more robust (model < RAM here) and achieves residency without wiring.
+     * Skip with HY3_NO_PREFAULT=1. */
+    const char *no_pf = getenv("HY3_NO_PREFAULT");
+    if (!(no_pf && no_pf[0] == '1')) {
+        double tl0 = now_sec();
+#ifdef MADV_WILLNEED
+        madvise(map, (size_t)st.st_size, MADV_WILLNEED);
+#endif
+        size_t page = (size_t)getpagesize();
+        volatile uint8_t sink = 0;
+        const uint8_t *p = (const uint8_t *)map;
+        for (size_t off = 0; off < (size_t)st.st_size; off += page) sink ^= p[off];
+        (void)sink;
+        fprintf(stderr, "hy3: prefaulted %.1f GiB resident in %.1fs\n",
+                (double)st.st_size / (1024.0*1024.0*1024.0), now_sec() - tl0);
+    }
+
     g->fd = fd;
     g->map = map;
     g->size = (uint64_t)st.st_size;
@@ -742,10 +762,6 @@ int hy3_model_load(hy3_model **out, const char *path, int n_threads) {
     if (!cursor_u64(&c, &g->n_kv)) die(c.error);
     if (g->version != 3) die("only GGUF v3 supported");
 
-    fprintf(stderr, "hy3: header: n_tensors=%llu n_kv=%llu c->pos=%llu\n",
-            (unsigned long long)g->n_tensors, (unsigned long long)g->n_kv,
-            (unsigned long long)c.pos);
-
     parse_metadata(g, &c);
     parse_tensors(g, &c);
 
@@ -756,12 +772,6 @@ int hy3_model_load(hy3_model **out, const char *path, int n_threads) {
 
     const hy3_tensor_info *embd = m->w.token_embd.t;
     if (embd->ndim != 2) die("token_embd.weight has unexpected ndim");
-    fprintf(stderr, "hy3: token_embd.weight ggml_type=%u (0=F32 1=F16 8=Q8_0 12=Q4_K) data=%p tensor_data_pos=%llu rel_off=%llu abs_offset=%llu file_size=%llu\n", 
-            embd->ggml_type, (void*)m->w.token_embd.data,
-            (unsigned long long)m->gguf.tensor_data_pos,
-            (unsigned long long)embd->rel_offset,
-            (unsigned long long)embd->abs_offset,
-            (unsigned long long)m->gguf.size);
     if (embd->dim[0] != HY3_N_VOCAB || embd->dim[1] != HY3_N_EMBD) {
         fprintf(stderr, "hy3: token_embd.weight shape: [%llu, %llu], expected [%d, %d]\n",
                 (unsigned long long)embd->dim[0], (unsigned long long)embd->dim[1],
@@ -1220,8 +1230,6 @@ int hy3_eval(hy3_model *m, const hy3_tokens *tokens, float *logits, int *pos) {
     }
 #endif
     
-    int start = *pos;
-
     for (int i = 0; i < tokens->len; i++) {
         int token = tokens->v[i];
 
@@ -1256,11 +1264,6 @@ int hy3_eval(hy3_model *m, const hy3_tokens *tokens, float *logits, int *pos) {
     const hy3_tensor_info *out_t = m->w.output.t;
     int n_vocab = (int)out_t->dim[0];
     mul_mat_f32(logits, m->w.output.data, out_t->ggml_type, m->embed, n_vocab, HY3_N_EMBD);
-    static double last_t = 0;
-
-    fprintf(stderr, "  logit[0..9]:");
-    for (int i = 0; i < 10; i++) fprintf(stderr, " %.2f", logits[i]);
-    fprintf(stderr, "\n");
 
     *pos = m->cache_len;
     return 0;
@@ -1337,6 +1340,7 @@ int hy3_generate(hy3_model *m, const hy3_tokens *prompt,
     input.cap = 0;
 
     hy3_tokens_push(&input, prompt->v[0]);
+    double t_prompt0 = now_sec();
     hy3_eval(m, &input, logits, &pos);
 
     for (int i = 1; i < prompt->len; i++) {
@@ -1346,9 +1350,10 @@ int hy3_generate(hy3_model *m, const hy3_tokens *prompt,
         single.cap = 1;
         hy3_eval(m, &single, logits, &pos);
     }
+    double t_prompt = now_sec() - t_prompt0;
 
     int n_generated = 0;
-    int last_token = 0;
+    double t_gen0 = now_sec();
 
     for (int i = 0; i < n_predict; i++) {
         int token = hy3_sample(m, logits, params->temperature, params->top_k, params->top_p);
@@ -1365,8 +1370,13 @@ int hy3_generate(hy3_model *m, const hy3_tokens *prompt,
         single.cap = 1;
         hy3_eval(m, &single, logits, &pos);
         n_generated++;
-        last_token = token;
     }
+    double t_gen = now_sec() - t_gen0;
+
+    fprintf(stderr,
+            "\nhy3: timing | prompt %d tok in %.3fs (%.2f tok/s) | gen %d tok in %.3fs (%.2f tok/s)\n",
+            prompt->len, t_prompt, prompt->len / (t_prompt + 1e-9),
+            n_generated, t_gen, n_generated / (t_gen + 1e-9));
 
     hy3_tokens_free(&input);
     free(logits);
