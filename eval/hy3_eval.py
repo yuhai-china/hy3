@@ -28,7 +28,7 @@ EXEC_TIMEOUT = 60      # seconds per code execution
 MAX_TOKENS   = 8000    # -n per question
 EXPERTS      = int(os.environ.get("HY3_EVAL_EXPERTS", "8"))  # MoE experts per token
 TEMP         = float(os.environ.get("HY3_EVAL_TEMP", "1.0")) # sampling temperature
-THINK        = os.environ.get("HY3_EVAL_THINK", "0") == "1"  # reasoning block
+THINK        = True #os.environ.get("HY3_EVAL_THINK", "0") == "1"  # reasoning block
 
 # ─── Code Execution Engine ────────────────────────────────────────────────────
 
@@ -383,7 +383,8 @@ def run_hy3_batch(tests: list) -> list:
 
     t0 = time.time()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1)
+                            text=True, bufsize=1,
+                            encoding="utf-8", errors="replace")
 
     results = [None] * len(tests)
     cur_idx = None          # question currently being received, or None

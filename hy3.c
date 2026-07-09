@@ -1295,10 +1295,22 @@ int hy3_eval(hy3_model *m, const hy3_tokens *tokens, float *logits, int *pos) {
 int hy3_sample(hy3_model *m, const float *logits, float temperature, int top_k, float top_p) {
     int n = HY3_N_VOCAB_VALID;
 
+    /* Greedy (argmax) when temperature is ~0. A true argmax avoids the
+     * degenerate softmax with inv_temp=1000 used before, which amplified
+     * floating-point noise among near-tied logits (common inside a reasoning
+     * block) and could underflow the whole distribution to zero/NaN, producing
+     * garbage tokens. */
+    if (temperature < 0.001f) {
+        int best = 0;
+        float best_v = -FLT_MAX;
+        for (int i = 0; i < n; i++)
+            if (logits[i] > best_v) { best_v = logits[i]; best = i; }
+        return best;
+    }
+
     float *probs = xmalloc(n * sizeof(float));
     memcpy(probs, logits, n * sizeof(float));
 
-    if (temperature < 0.001f) temperature = 0.001f;
     float inv_temp = 1.0f / temperature;
 
     float max_val = -FLT_MAX;
