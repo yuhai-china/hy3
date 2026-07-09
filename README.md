@@ -7,6 +7,12 @@ Mixture-of-Experts model released by **Tencent's Hunyuan ("Hy") team**
 
 The project is called **hy3**.
 
+> **Derivative project.** hy3 is a third-party derivative of the official
+> **[`tencent/Hy3`](https://huggingface.co/tencent/Hy3)** model — it re-implements
+> loading/inference from scratch and is not affiliated with or endorsed by Tencent.
+> Pre-converted GGUF weights produced by this project's converter can be
+> downloaded from **[`cloudyu/hy3-gguf`](https://huggingface.co/cloudyu/hy3-gguf)**.
+
 > **⚠️ Testing scope:** All recent performance work (single-command-buffer
 > forward, concurrent encoder, GPU-resident MoE routing, fused per-head RMS
 > norm, SIMD-group matmul kernels, `MTLResidencySet` warm-up) and all benchmark
