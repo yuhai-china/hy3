@@ -41,7 +41,7 @@ EXEC_TIMEOUT = 60      # seconds per code execution
 MAX_TOKENS   = int(os.environ.get("HY3_EVAL_MAX_TOKENS", "8000"))  # -n per question
 EXPERTS      = int(os.environ.get("HY3_EVAL_EXPERTS", "8"))  # MoE experts per token
 TEMP         = float(os.environ.get("HY3_EVAL_TEMP", "1.0")) # sampling temperature
-THINK        = os.environ.get("HY3_EVAL_THINK", "low")       # reasoning: off | low | high
+THINK        = os.environ.get("HY3_EVAL_THINK", "off")       # reasoning: off | low | high
 # Backend: "cuda" (default, NVIDIA) drives --gpu-layers N; "metal" drives --metal.
 BACKEND      = os.environ.get("HY3_EVAL_BACKEND", "cuda").lower()
 # For CUDA: how many transformer layers to offload to the GPU (80 = full offload).
