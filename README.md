@@ -38,6 +38,27 @@ The project is called **hy3**.
 > trust `--gpu-layers` above ~20-40 on this checkpoint yet, and don't add
 > back "a"-suffixed nvcc arch flags without re-verifying on real hardware.
 
+# Recommended: ` top k experts = 4 instead of 8`
+
+The checkpoint is natively top-8, but **we recommend running with `-experts 4`**
+— it activates only the 4 highest-scoring routed experts per token instead of 8,
+which roughly halves the routed Q4_K matmul work (the dominant decode cost) for a
+noticeable speedup, with **no measurable quality loss on our test suites**:
+
+| Suite (CUDA, `--gpu-layers 80`, think off) | `-experts 8` | `-experts 4` |
+|--------------------------------------------|:------------:|:------------:|
+| Reasoning/coding benchmark (13 tasks, `temp 1.0`) | 9/13 | 10/13 |
+| Tool-calling (6 cases, `temp 0` greedy) | 5/6 | 5/6 |
+
+The tool-calling result is identical (deterministic greedy), and the 9-vs-10
+benchmark difference is within `temp=1.0` sampling noise — i.e. the two settings
+are statistically indistinguishable in quality while `-experts 4` is faster
+(fewer routed experts = less Q4_K matmul per token). Run the suites yourself with
+`HY3_EVAL_EXPERTS=4` / `HY3_TOOL_EXPERTS=4` (see `eval/`). Use `-experts 8` if you
+want the model's native routing; drop to `-experts 2`/`1` for maximum speed at
+some quality cost.
+
+
 ## Model facts
 
 | | |
