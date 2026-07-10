@@ -217,7 +217,8 @@ typedef struct {
     float *d_token_embd,*d_output_norm; half *d_output;   /* d_output: FP16 GEMV */
     half  *d_layer_attn_qkv[81],*d_layer_attn_output[81]; /* FP16 GEMV weights */
     float *d_layer_attn_q_norm[81],*d_layer_attn_k_norm[81],*d_layer_attn_norm[81],*d_layer_ffn_norm[81];
-    half  *d_layer_ffn_gate_inp[81],*d_layer_ffn_down_shexp[81],*d_layer_ffn_gateup_shexp[81];
+    float *d_layer_ffn_gate_inp[81];   /* router: FP32 for stable top-k argmax */
+    half  *d_layer_ffn_down_shexp[81],*d_layer_ffn_gateup_shexp[81];
     float *d_layer_eh_proj[81],*d_layer_enorm[81],*d_layer_hnorm[81],*d_layer_final_norm[81];
     float *d_layer_expert_bias[81];
     half  *d_layer_dense_ffn_gate[81],*d_layer_dense_ffn_up[81],*d_layer_dense_ffn_down[81];
@@ -308,7 +309,7 @@ int hy3_gpu_init(hy3_model *m,int n_gpu_layers){
             ctx->d_layer_dense_ffn_up[il]=upload_weight_half(&l->ffn_up);
             ctx->d_layer_dense_ffn_down[il]=upload_weight_half(&l->ffn_down);
         } else {
-            ctx->d_layer_ffn_gate_inp[il]=upload_weight_half(&l->ffn_gate_inp);
+            ctx->d_layer_ffn_gate_inp[il]=upload_weight_dense(&l->ffn_gate_inp);
             ctx->d_layer_ffn_down_shexp[il]=upload_weight_half(&l->ffn_down_shexp);
             { float*g=upload_weight_dense(&l->ffn_gate_shexp),*u=upload_weight_dense(&l->ffn_up_shexp);
               size_t gm=(size_t)HY3_MOE_INTERMED*HY3_N_EMBD;
@@ -369,6 +370,14 @@ static void gpu_mul_mat(gpu_ctx_t*ctx,const float*x,float*dst,const half*w,int m
                  w,CUDA_R_16F,n, ctx->d_xf16,CUDA_R_16F,n, &b, dst,CUDA_R_32F,m,
                  CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
 }
+/* Full-FP32 GEMV (no FP16 rounding of weights or activations). Used for the
+ * MoE router projection, whose top-k argmax over near-equal expert scores is
+ * the model's most precision-sensitive step: FP16 rounding there flips routing
+ * decisions and compounds across depth. dst[j] = dot(row j of w, x). */
+static void gpu_mul_mat_f32(gpu_ctx_t*ctx,const float*x,float*dst,const float*w,int m,int n){
+    float a=1.f,b=0.f;
+    cublasSgemv(ctx->cublas,CUBLAS_OP_T,n,m,&a,w,n,x,1,&b,dst,1);
+}
 static void gpu_rms_norm(gpu_ctx_t*ctx,float*o,const float*x,const float*w,int n){
     rms_norm_kernel<<<1,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(o,x,w,n);
 }
@@ -404,7 +413,7 @@ static void encode_layer_gpu(gpu_ctx_t*ctx,hy3_model*m,int il){
         add_kernel<<<(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(x,x,s,HY3_N_EMBD);
     } else {
         int nu=m->n_expert_used;
-        gpu_mul_mat(ctx,s,ctx->d_scratch2,ctx->d_layer_ffn_gate_inp[il],HY3_N_EXPERT,HY3_N_EMBD);
+        gpu_mul_mat_f32(ctx,s,ctx->d_scratch2,ctx->d_layer_ffn_gate_inp[il],HY3_N_EXPERT,HY3_N_EMBD);
         router_topk_kernel<<<1,256,0,ctx->stream>>>(ctx->d_scratch2,ctx->d_layer_expert_bias[il],ctx->d_router_ids,ctx->d_router_wts,HY3_N_EXPERT,(uint32_t)nu,m->w.layers[il].has_expert_bias?1u:0u,2.826f);
         /* Fork: the routed-expert Q4_K matmuls (which dominate the layer) run on
          * stream2 while the small shared-expert FP16 GEMVs run on the main
@@ -510,7 +519,7 @@ int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
             } else {
                 int nu=m->n_expert_used;
                 gpu_rms_norm(ctx,s,x,ctx->d_layer_ffn_norm[il],HY3_N_EMBD);
-                gpu_mul_mat(ctx,s,ctx->d_scratch2,ctx->d_layer_ffn_gate_inp[il],HY3_N_EXPERT,HY3_N_EMBD);
+                gpu_mul_mat_f32(ctx,s,ctx->d_scratch2,ctx->d_layer_ffn_gate_inp[il],HY3_N_EXPERT,HY3_N_EMBD);
                 router_topk_kernel<<<1,256,0,ctx->stream>>>(ctx->d_scratch2,ctx->d_layer_expert_bias[il],ctx->d_router_ids,ctx->d_router_wts,HY3_N_EXPERT,(uint32_t)nu,m->w.layers[il].has_expert_bias?1u:0u,2.826f);
                 float*sg=(float*)ctx->d_scratch2+HY3_N_EXPERT*2,*su=sg+HY3_MOE_INTERMED;
                 gpu_mul_mat(ctx,s,sg,ctx->d_layer_ffn_gateup_shexp[il],2*HY3_MOE_INTERMED,HY3_N_EMBD);
