@@ -245,13 +245,17 @@ kernel void kv_cache_write(device half        *k_cache  [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------
-// Attention over the layer-interleaved KV cache.
-// slot(t, layer) = t * n_layers + layer.  Dispatched with n_heads
-// threadgroups; every thread in a group redundantly computes the full
-// score vector (cheap relative to the head_dim=128 dot products, and
-// avoids a second synchronization point) then only the final
-// value-weighted sum is split across threads. Mirrors attention_kernel in
-// hy3_gpu.cu exactly.
+// Online-softmax (flash-style) attention. Single pass over the KV cache:
+// each K and V vector is read exactly once, a running max `m` and
+// denominator `l` are maintained, and the value accumulator is rescaled
+// online. No materialized score array -> no context-length ceiling and
+// ~half the KV global traffic of the old two-pass kernel.
+//
+// One threadgroup per head, head_dim (=128) threads. Thread `d` owns output
+// dimension `d` and its accumulator `acc`. Per timestep the score q·k is
+// computed by a cooperative threadgroup reduction, then every thread applies
+// the online-softmax rescale and adds this timestep's contribution.
+// slot(t, layer) = t*n_layers + layer.  Accumulate in float.
 // ---------------------------------------------------------------------
 kernel void attention(device float       *out      [[buffer(0)]],
                        device const float *q        [[buffer(1)]],
@@ -264,10 +268,12 @@ kernel void attention(device float       *out      [[buffer(0)]],
                        constant uint      &kv_group   [[buffer(8)]],
                        constant int       &layer_id   [[buffer(9)]],
                        constant int       &n_layers   [[buffer(10)]],
-                       threadgroup float  *scores     [[threadgroup(0)]],
+                       threadgroup float  *red        [[threadgroup(0)]],
                        uint h    [[threadgroup_position_in_grid]],
                        uint tid  [[thread_index_in_threadgroup]],
-                       uint tgSz [[threads_per_threadgroup]])
+                       uint tgSz [[threads_per_threadgroup]],
+                       uint simd_lane [[thread_index_in_simdgroup]],
+                       uint simd_grp  [[simdgroup_index_in_threadgroup]])
 {
     if (h >= n_heads) return;
     uint kv_h = h / kv_group;
@@ -276,59 +282,42 @@ kernel void attention(device float       *out      [[buffer(0)]],
 
     int ntok = (kv_len - layer_id + n_layers - 1) / n_layers;
     if (ntok < 1) ntok = 1;
-    if (ntok > 8192) ntok = 8192;
 
-    // Cooperatively compute the score vector into shared memory: each thread
-    // handles a strided subset of the timesteps. `scores` is threadgroup
-    // (shared) memory, so this MUST be split across threads with barriers --
-    // having every thread redundantly write the whole array (as the CUDA
-    // port's per-thread-local version did) races here and corrupts attention.
-    threadgroup float shared_max[128];
-    threadgroup float shared_sum[128];
+    /* q value this thread contributes to every dot product (thread d owns dim d). */
+    float qd = (tid < head_dim) ? q_h[tid] : 0.0f;
 
-    float local_max = -INFINITY;
-    for (int t = (int)tid; t < ntok; t += (int)tgSz) {
-        device const half *k_t = k_cache + (size_t)(t * n_layers + layer_id) * n_kv_heads * head_dim
-                                           + (size_t)kv_h * head_dim;
+    const uint n_simd = tgSz / 32;   /* number of simdgroups (128/32 = 4) */
+
+    float m = -INFINITY;   /* running max score */
+    float l = 0.0f;        /* running denominator */
+    float acc = 0.0f;      /* running sum_t softmax_t * V[t][d] for this d */
+
+    for (int t = 0; t < ntok; t++) {
+        size_t base = (size_t)(t * n_layers + layer_id) * n_kv_heads * head_dim
+                    + (size_t)kv_h * head_dim;
+        /* score = scale * sum_d q[d]*k[d]; reduce partial products across threads. */
+        float part = (tid < head_dim) ? qd * (float)k_cache[base + tid] : 0.0f;
+        part = simd_sum(part);
+        if (simd_lane == 0) red[simd_grp] = part;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         float s = 0.0f;
-        for (uint d = 0; d < head_dim; d++) s += q_h[d] * (float)k_t[d];
+        for (uint i = 0; i < n_simd; i++) s += red[i];
         s *= scale;
-        scores[t] = s;
-        if (s > local_max) local_max = s;
-    }
-    shared_max[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgSz / 2; s > 0; s >>= 1) {
-        if (tid < s) shared_max[tid] = max(shared_max[tid], shared_max[tid + s]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float max_score = shared_max[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float local_sum = 0.0f;
-    for (int t = (int)tid; t < ntok; t += (int)tgSz) {
-        float e = exp(scores[t] - max_score);
-        scores[t] = e;
-        local_sum += e;
+        /* online-softmax update */
+        float m_new = max(m, s);
+        float corr = exp(m - m_new);
+        float p = exp(s - m_new);
+        l = l * corr + p;
+        float vd = (tid < head_dim) ? (float)v_cache[base + tid] : 0.0f;
+        acc = acc * corr + p * vd;
+        m = m_new;
     }
-    shared_sum[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgSz / 2; s > 0; s >>= 1) {
-        if (tid < s) shared_sum[tid] += shared_sum[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float inv = 1.0f / (shared_sum[0] + 1e-10f);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    device float *out_h = out + (size_t)h * head_dim;
-    for (uint d = tid; d < head_dim; d += tgSz) {
-        float val = 0.0f;
-        for (int t = 0; t < ntok; t++) {
-            device const half *v_t = v_cache + (size_t)(t * n_layers + layer_id) * n_kv_heads * head_dim
-                                               + (size_t)kv_h * head_dim;
-            val += scores[t] * inv * (float)v_t[d];
-        }
-        out_h[d] = val;
+    if (tid < head_dim) {
+        device float *out_h = out + (size_t)h * head_dim;
+        out_h[tid] = acc / (l + 1e-10f);
     }
 }
 

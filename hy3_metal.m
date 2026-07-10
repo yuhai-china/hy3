@@ -587,7 +587,7 @@ static void m_attention(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
     [enc setBytes:&kv_group length:sizeof(kv_group) atIndex:8];
     [enc setBytes:&layer_id length:sizeof(layer_id) atIndex:9];
     [enc setBytes:&n_layers length:sizeof(n_layers) atIndex:10];
-    [enc setThreadgroupMemoryLength:8192 * sizeof(float) atIndex:0];
+    [enc setThreadgroupMemoryLength:64 * sizeof(float) atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
