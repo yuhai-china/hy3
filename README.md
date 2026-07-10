@@ -196,8 +196,14 @@ benchmark difference is within `temp=1.0` sampling noise — i.e. the two settin
 are statistically indistinguishable in quality while `-experts 4` is faster
 (fewer routed experts = less Q4_K matmul per token). Run the suites yourself with
 `HY3_EVAL_EXPERTS=4` / `HY3_TOOL_EXPERTS=4` (see `eval/`). Use `-experts 8` if you
-want the model's native routing; drop to `-experts 2`/`1` for maximum speed at
-some quality cost.
+want the model's native routing.
+
+**Do not go below `-experts 3`.** `-experts 2` (and `1`) produce incoherent
+gibberish — verified at both `--gpu-layers 20` and `80` with greedy decoding, so
+it is a model-capacity floor, not a backend bug: this top-8 checkpoint loses too
+much routed-FFN capacity below ~3 activated experts. `-experts 3` is still
+coherent; **4 is the recommended sweet spot** (full quality, meaningfully faster
+than 8).
 
 ### Sizing GPU/Metal offload
 
