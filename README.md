@@ -184,29 +184,31 @@ reproducible comparisons), `-top_k`/`-top_p`, `-t` CPU thread count,
 
 ### Recommended: `-experts 4`
 
-The checkpoint is natively top-8, but **we recommend running with `-experts 4`**
-— it activates only the 4 highest-scoring routed experts per token instead of 8,
-which roughly halves the routed Q4_K matmul work (the dominant decode cost) for a
-noticeable speedup, with **no measurable quality loss on our test suites**:
+The checkpoint is natively top-8. Running with `-experts 4` (only the 4
+highest-scoring routed experts per token) is a reasonable default — **same
+quality, less GPU work** — but be clear about the size of the win:
 
 | Suite (CUDA, `--gpu-layers 80`, think off) | `-experts 8` | `-experts 4` |
 |--------------------------------------------|:------------:|:------------:|
 | Reasoning/coding benchmark (13 tasks, `temp 1.0`) | 9/13 | 10/13 |
 | Tool-calling (6 cases, `temp 0` greedy) | 5/6 | 5/6 |
+| Pure-GPU graph replay (ms/token, small ctx) | ~20.1 | ~16.1 |
+| **End-to-end decode (eval suites)** | **~21 tok/s** | **~21 tok/s** |
 
-The tool-calling result is identical (deterministic greedy), and the 9-vs-10
-benchmark difference is within `temp=1.0` sampling noise — i.e. the two settings
-are statistically indistinguishable in quality while `-experts 4` is faster
-(fewer routed experts = less Q4_K matmul per token). Run the suites yourself with
-`HY3_EVAL_EXPERTS=4` / `HY3_TOOL_EXPERTS=4` (see `eval/`). Use `-experts 8` if you
-want the model's native routing.
+Quality is indistinguishable (tool-calling identical; 9-vs-10 is within
+`temp=1.0` noise). On-device, `-experts 4` genuinely does ~half the routed
+matmul work and the pure-GPU kernel time drops ~20% (20.1 → 16.1 ms/token).
+**But end-to-end throughput is essentially the same (~21 tok/s)** — the ~4
+ms/token saved is a small slice of the real per-token cost, which is dominated
+by sampling (120K-vocab top-k/top-p), detokenization, host overhead, and
+attention over a growing KV cache. So pick `-experts 4` to save compute/energy
+at equal quality, not because it feels faster; use `-experts 8` for the model's
+native routing. Reproduce with `HY3_EVAL_EXPERTS` / `HY3_TOOL_EXPERTS` (`eval/`).
 
 **Do not go below `-experts 3`.** `-experts 2` (and `1`) produce incoherent
 gibberish — verified at both `--gpu-layers 20` and `80` with greedy decoding, so
 it is a model-capacity floor, not a backend bug: this top-8 checkpoint loses too
-much routed-FFN capacity below ~3 activated experts. `-experts 3` is still
-coherent; **4 is the recommended sweet spot** (full quality, meaningfully faster
-than 8).
+much routed-FFN capacity below ~3 activated experts.
 
 ### Sizing GPU/Metal offload
 
