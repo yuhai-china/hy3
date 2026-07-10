@@ -1233,7 +1233,7 @@ static void forward_model(hy3_model *m, int token) {
  * ========================================================================= */
 
 #ifdef HY3_CUDA
-int hy3_gpu_init(hy3_model *m);
+int hy3_gpu_init(hy3_model *m, int n_gpu_layers);
 void hy3_gpu_free(hy3_model *m);
 int hy3_gpu_eval(hy3_model *m, const hy3_tokens *tokens, float *logits, int *pos);
 #endif
@@ -1389,9 +1389,14 @@ int hy3_generate(hy3_model *m, const hy3_tokens *prompt,
 
     int n_generated = 0;
     double t_gen0 = now_sec();
+    int timing_dbg = getenv("HY3_TIMING") != NULL;
+    double t_eval_acc = 0.0, t_sample_acc = 0.0;
 
     for (int i = 0; i < n_predict; i++) {
+        double ts0 = now_sec();
         int token = hy3_sample(m, logits, params->temperature, params->top_k, params->top_p);
+        double ts1 = now_sec();
+        t_sample_acc += ts1 - ts0;
         /* Stop on any Hunyuan V3 end-of-turn / end-of-sequence marker:
          * eos(120025), endofsentence(120001), EOT(120008). */
         if (token == hy3_token_eos(m) || token == 120001 || token == 120008) {
@@ -1404,10 +1409,17 @@ int hy3_generate(hy3_model *m, const hy3_tokens *prompt,
         single.v = &token;
         single.len = 1;
         single.cap = 1;
+        double te0 = now_sec();
         hy3_eval(m, &single, logits, &pos);
+        t_eval_acc += now_sec() - te0;
         n_generated++;
     }
     double t_gen = now_sec() - t_gen0;
+    if (timing_dbg)
+        fprintf(stderr, "hy3: gen breakdown | eval %.3fs (%.1f%%) sample %.3fs (%.1f%%) other %.3fs\n",
+                t_eval_acc, 100.0 * t_eval_acc / (t_gen + 1e-9),
+                t_sample_acc, 100.0 * t_sample_acc / (t_gen + 1e-9),
+                t_gen - t_eval_acc - t_sample_acc);
 
     fprintf(stderr,
             "\nhy3: timing | prompt %d tok in %.3fs (%.2f tok/s) | gen %d tok in %.3fs (%.2f tok/s)\n",

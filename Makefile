@@ -32,7 +32,31 @@ else
 endif
 
 NVCC ?= nvcc
-NVCC_FLAGS ?= -O3 -arch=sm_90 -Xcompiler -fopenmp -Xcompiler -pthread
+# Blackwell (B200/B300, compute capability 10.x): sm_100 is this toolkit's
+# newest officially-named real target (CUDA 12.8's nvcc has no explicit
+# `sm_103` for "Blackwell Ultra" B300, which `nvidia-smi --query-gpu=compute_cap`
+# reports as 10.3) -- so we also embed compute_100 *PTX* alongside the
+# sm_100 cubin, and the driver JIT-compiles that PTX to real B300 SASS at
+# load time. sm_90 (Hopper H100/H200) is kept for the existing README
+# sizing guidance ("H200 (144GB) ... --gpu-layers 40-47").
+#
+# IMPORTANT: use the plain `sm_90`/`sm_100`/`compute_100` targets, NOT the
+# family-specific "a"-suffixed ones (`sm_90a`, `sm_100a`, `compute_100a`).
+# Empirically verified on a real NVIDIA B300 SXM6 (driver 580.126.09, CUDA
+# 12.8) with the real ~162GB hy3 checkpoint: building with ANY "a"-suffixed
+# target -- whether real `sm_100a`/`sm_90a` cubin or JIT-compiled from
+# `compute_100a`/`compute_90a` PTX -- launches without any CUDA error but
+# silently corrupts every kernel's output (all-zero logits from the very
+# first token, on every layer). The plain (non-"a") `sm_90`/`sm_100`
+# targets produce correct, verified logits (matching the CPU backend's
+# output token-for-token on "11+22+33=?") on the exact same hardware. Do
+# not add "a" suffixes back without re-verifying end to end on real
+# hardware with a real checkpoint -- this is not a hypothetical concern,
+# it silently breaks inference with no error message.
+NVCC_ARCH_FLAGS ?= -gencode arch=compute_90,code=sm_90 \
+                    -gencode arch=compute_100,code=sm_100 \
+                    -gencode arch=compute_100,code=compute_100
+NVCC_FLAGS ?= -O3 $(NVCC_ARCH_FLAGS) -Xcompiler -fopenmp -Xcompiler -pthread
 CUDA_LIBS ?= -lcublas -lcudart
 
 .PHONY: all clean
