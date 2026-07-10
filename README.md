@@ -18,11 +18,17 @@ The project is called **hy3**.
 The engine runs on **CPU**, **CUDA** (NVIDIA, `hy3_gpu.cu`), and **Metal**
 (Apple Silicon, `hy3_metal.m`), all verified 
 
-Current best CUDA decode on a single **NVIDIA B300** (Blackwell Ultra), full
-80-layer offload of the ~162GB `hy3_q4k_mixed.gguf`: **~44 tok/s end-to-end
-(~49 tok/s pure-GPU graph replay), coherent output**. The full step-by-step
-optimization history (what changed, why, and the measured effect at each step)
-lives in dedicated docs:
+CUDA decode on a single **NVIDIA B300** (Blackwell Ultra), full 80-layer
+offload of the ~162GB `hy3_q4k_mixed.gguf`, measured end-to-end on the
+`eval/` suites (greedy/temp-1.0, real multi-hundred-token generations):
+**~16–29 tok/s, typically ~20 tok/s**. Longer outputs are slower because
+per-token cost grows with the KV cache. (A pure-GPU CUDA-graph *replay* at
+small context clocks ~20 ms/token ≈ 49 tok/s, but that is a kernel-level
+ceiling — it excludes sampling/detokenization/host overhead and does not grow
+with context, so it is **not** representative of end-to-end throughput.) Up
+from a ~4.6 tok/s starting point; the full step-by-step optimization history
+(what changed, why, and the measured effect at each step) lives in dedicated
+docs:
 
 - **[`docs/CUDA_OPTIMIZATION.md`](docs/CUDA_OPTIMIZATION.md)** — CUDA decode
   4.6 → ~49 tok/s (also [`docs/CUDA_OPTIMIZATION.zh.md`](docs/CUDA_OPTIMIZATION.zh.md), 中文).

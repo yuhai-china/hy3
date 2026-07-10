@@ -1,9 +1,21 @@
 # Optimizing GGUF Inference on CUDA — Step by Step
 
-This document records, in order, how we took the CUDA decode path of the Hy3
+This document records, in order, how we sped up the CUDA decode path of the Hy3
 GGUF runtime (`HYV3ForCausalLM`, a 295B-parameter / 21B-active MoE model in
-Q4_K_M) from **4.6 tok/s to 44 tok/s** at full 80-layer GPU offload on a single
-NVIDIA **B300** (Blackwell Ultra, compute capability 10.3), CUDA 12.8.
+Q4_K_M) at full 80-layer GPU offload on a single NVIDIA **B300** (Blackwell
+Ultra, compute capability 10.3), CUDA 12.8.
+
+> **Read the numbers carefully.** The pure-GPU CUDA-graph *replay* time improved
+> from ~217 ms/token (baseline) to **~20 ms/token (≈49 tok/s)** — that is the
+> kernel-level figure this doc mostly quotes, and it is a real ~10× speedup of
+> the on-device work. **It is not end-to-end user throughput.** Measured
+> end-to-end on the `eval/` suites (real multi-hundred-token generations,
+> including sampling/detokenization and a KV cache that grows with output
+> length), sustained decode is **~16–29 tok/s, typically ~20 tok/s**. Short
+> `-n 40`-style runs at tiny context read higher (that's where an earlier
+> "44 tok/s" claim came from) but are not representative. Treat the per-step
+> tok/s below as **relative** progress on the replay/short-run metric, not as
+> promises of sustained throughput.
 
 The intent is that a future engineer can reproduce the reasoning, understand
 *why* each step helped, and avoid the traps we hit.
@@ -219,8 +231,9 @@ from a second pass of logic.
 
 ### Result
 
-- Pure graph replay: **42.3 → 22.3 ms/token.**
-- End-to-end at 80 layers: **22.68 → 44 tok/s** (≈2×).
+- Pure graph replay: **42.3 → 22.3 ms/token** (the reliable metric here).
+- Short-run tok/s roughly doubled; sustained end-to-end (see the note at the
+  top) is ~20 tok/s, not the ~44 a short `-n 40` run reports.
 
 This single coalescing change is the largest late-stage win, because it attacked
 the exact bottleneck the profiler identified: uncoalesced Q4_K weight reads.
@@ -294,9 +307,15 @@ f32→f16 conversion). Cost: +240 MB of weights.
 | 5 | CUDA graph decode | 13.84 |
 | 6 | Warp-per-row Q4_K expert matmul | 20.4 |
 | 7 | Q4_K sub-block parallelism | 22.68 |
-| 8 | **Coalesced warp-cooperative Q4_K row dot** | **44** |
+| 8 | **Coalesced warp-cooperative Q4_K row dot** | ~44 (short-run) |
 | 9 | Shared/routed expert overlap (2nd stream) | ~48 (pure GPU) |
 | 10 | FP32 router GEMV (stability; ~neutral speed) | ~49 (pure GPU) |
+
+> The tok/s column mixes measurement methods (early rows are short end-to-end
+> runs, later rows are pure-GPU graph replay). The consistent, reliable metric
+> is **graph-replay ms/token**, which went ~217 → **~20 ms/token**. **Sustained
+> end-to-end throughput on real generations is ~16–29 tok/s (~20 typical)** — do
+> not read the "44"/"49" as user-visible speed.
 
 Pure GPU graph replay ended at ~20.3 ms/token (~49 tok/s). Peak resident memory
 ~192 GB (+240 MB after the FP32 router).
