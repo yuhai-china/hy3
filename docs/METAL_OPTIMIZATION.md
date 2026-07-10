@@ -10,6 +10,37 @@ recommended change.
 
 ---
 
+## STATUS (measured on M2 Ultra, hy3_q4k_mixed, experts=8)
+
+Following rule §7.1 ("profile first — do not assume it matches CUDA"), the
+suggestions below were re-prioritized against real measurements:
+
+- **§1 online-softmax attention — DONE** (commit: flash-style single pass,
+  fp16-KV, no `scores[]`, no 8192 ceiling). Smoke tests pass.
+- **§3 FP32 router — SKIP.** `blk.*.ffn_gate_inp.weight` is already `F32` in the
+  GGUF, so `m_mul_mat` already dispatches `matmul_f32` for the router. No-op.
+- **§2 ICB / pre-encoded command buffer — NOT WORTH IT here.** Measured CPU
+  encode = **0.57 ms/token vs GPU exec = 43 ms/token (1.3%)**. The doc's premise
+  ("at 30+ tok/s CPU encode becomes a real fraction") does not hold on this
+  setup; an ICB would reclaim at most 1.3%.
+- **§4 fusions — LOW VALUE here.** Launch/encode overhead is the 1.3% above, and
+  in the concurrent encoder independent matmuls already overlap. QKV/gate+up
+  fusion does not reduce weight bandwidth (same bytes read), only the tiny
+  activation re-read. Not pursued.
+
+**Measured token breakdown (experts differential):** ~2.36 ms per routed expert
+(3 Q4_K matmuls); routed experts ≈ 44% of the token, everything else
+(attention + shared expert + dense + output GEMV + norms) ≈ 56%. Both halves are
+genuine memory-bandwidth-bound compute — the real wins were the bandwidth ones
+(online-softmax attention §1, fp16 KV cache), not overhead removal (§2/§4).
+
+The remaining headroom is either lower precision (already Q4_K/Q8_0) or fewer
+activated params (runtime `-experts`, already available), or multi-token decode
+(speculative / the unused MTP layer 80) — a different class of change from this
+document.
+
+---
+
 ## 0. What Metal already has (parity with the CUDA wins)
 
 Before listing opportunities, note the Metal fast path
