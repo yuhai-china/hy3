@@ -227,6 +227,61 @@ the exact bottleneck the profiler identified: uncoalesced Q4_K weight reads.
 
 ---
 
+## 9b. Step 9 — Overlap shared-expert GEMV with routed-expert matmuls (2nd stream)
+
+Commit `a696f8f`.
+
+Each MoE layer runs two independent bodies of work: the **routed** experts (8
+Q4_K matmuls — the dominant cost) and the small **shared** expert (FP16
+cublas GEMVs). They were serialized on one stream. We now fork the routed
+matmuls onto a second CUDA stream (`stream2`) while the shared-expert GEMVs run
+on the main stream, then join before the final combine:
+
+- Fork after routing: `cudaEventRecord(ev_fork, main)` →
+  `cudaStreamWaitEvent(stream2, ev_fork)`.
+- Routed gate_up / silu / down on `stream2`; shared gate_up / silu / down on
+  main. Both read the layer input `s` **read-only**; the shared-down output is
+  retargeted from `s` to the free `ao` scratch to remove a write-after-read
+  hazard on `s`.
+- Join before combine: `cudaEventRecord(ev_join, stream2)` →
+  `cudaStreamWaitEvent(main, ev_join)`.
+
+This multi-stream fork/join is captured *into the CUDA graph* via events (the
+standard multi-stream capture pattern), so decode still replays as one graph.
+
+**Result: graph replay 22.3 → 20.8 ms/token (45 → 48 tok/s pure GPU).** The gain
+is modest (~7%) and bounded: the routed matmuls launch ~1500–4000 blocks and
+already saturate the ~148 SMs, so the shared GEMV has little spare occupancy to
+overlap into. Still a free, correctness-preserving win.
+
+## 9c. Step 10 — FP32 router GEMV for routing stability across depth
+
+Commit `5285365`.
+
+**Investigation.** The earlier "diverges above ~50 layers" caveat was
+re-examined. With greedy (temp 0) decoding, outputs at 40/50/60/70/80 layers are
+*identical* for short prompts; the divergence only appears in long generations
+and is **benign** (e.g. 20-layer chooses `\( … \)` inline math where 80-layer
+chooses `\[ … \]` display math — same content, both correct). It is never a
+wrong answer; it is a tie-break flip in the hard top-k router amplified by
+floating-point drift accumulated across more GPU layers.
+
+**Root cause.** The router projection (`ffn_gate_inp`, a tiny `[192 × 4096]`
+matrix) was an **FP16** `cublasGemmEx`. The router's `argmax` over near-equal
+expert scores is the single most precision-sensitive step in the model, so FP16
+rounding there is what flips routes.
+
+**Fix.** Store the router weight in FP32 and compute its GEMV in full FP32 via
+`cublasSgemv` (`gpu_mul_mat_f32`). Everything else stays FP16.
+
+**Result.** On a long greedy generation, the identical-output prefix between
+20-layer and 80-layer offload extended **from 243 → 1055 characters (4.3×)**;
+the remaining split is again benign phrasing. No performance regression (graph
+replay 20.8 → 20.3 ms/token — the SGEMV is tiny and we drop the router's
+f32→f16 conversion). Cost: +240 MB of weights.
+
+---
+
 ## 10. Overall progression
 
 | Step | Change | tok/s (80 layers) |
@@ -240,8 +295,11 @@ the exact bottleneck the profiler identified: uncoalesced Q4_K weight reads.
 | 6 | Warp-per-row Q4_K expert matmul | 20.4 |
 | 7 | Q4_K sub-block parallelism | 22.68 |
 | 8 | **Coalesced warp-cooperative Q4_K row dot** | **44** |
+| 9 | Shared/routed expert overlap (2nd stream) | ~48 (pure GPU) |
+| 10 | FP32 router GEMV (stability; ~neutral speed) | ~49 (pure GPU) |
 
-Pure GPU graph replay ended at ~22.3 ms/token. Peak resident memory ~192 GB.
+Pure GPU graph replay ended at ~20.3 ms/token (~49 tok/s). Peak resident memory
+~192 GB (+240 MB after the FP32 router).
 
 ---
 
@@ -262,12 +320,12 @@ Two quick checks:
    ```
    Must answer "Paris" and stay coherent.
 
-**Known limitation (not a regression):** above ~40–50 offloaded layers the
-output can diverge from the CPU reference. The cause is that GPU vs. CPU
-floating-point reduction order slightly perturbs the model's *hard* top-k MoE
-routing — a tie-break flips an expert selection, which cascades. It is inherent
-to reordered FP reductions on a razor-thin router margin, present before this
-work, and does not affect coherence at 80 layers.
+**Routing divergence (benign, and much reduced — see Step 10):** across GPU
+offload depths the greedy output can eventually diverge, but only as *benign
+phrasing/formatting* (never a wrong answer): a hard top-k tie-break flips under
+floating-point drift accumulated across more layers. Moving the router GEMV to
+FP32 pushed the identical 20-vs-80-layer greedy prefix from ~243 to ~1055
+characters. Short-prompt greedy output is identical across 40–80 layers.
 
 ---
 
@@ -285,19 +343,22 @@ HY3_GRAPH_BENCH=1 ./hy3-cli -m .../hy3_q4k_mixed.gguf --gpu-layers 80 \
 ./hy3-cli -m .../hy3_q4k_mixed.gguf --gpu-layers 80 \
   -p "Explain quantum entanglement in three sentences." -n 120 2>&1 | tail -1
 
-# Per-phase attribution
-HY3_TIMING=1 ...        # eval vs sample breakdown
-HY3_SKIP_EXP=1 ...      # subtract to isolate routed-expert cost
-HY3_SKIP_ATTN=1 ...     # isolate attention cost
-HY3_SKIP_FFN=1 ...      # isolate FFN cost
+# Per-token eval-vs-sample breakdown
+HY3_TIMING=1 ...
 ```
+
+> Historical note: differential phase-skipping env vars (`HY3_SKIP_ATTN` /
+> `HY3_SKIP_FFN` / `HY3_SKIP_EXP`) were used during development to attribute
+> time to each layer phase. They were removed once the routed-expert matmul
+> (the confirmed 85% bottleneck) was optimized; `git log` has the details.
 
 ---
 
 ## 13. General lessons (transferable to other GGUF/CUDA work)
 
-1. **Profile before optimizing.** Differential phase-skipping (`HY3_SKIP_*`)
-   told us experts were 85% of the token — everything else was a distraction.
+1. **Profile before optimizing.** Differential phase-skipping (temporary
+   `HY3_SKIP_*` env vars) told us experts were 85% of the token — everything
+   else was a distraction.
 2. **Decode is latency/bandwidth-bound, not FLOP-bound.** GEMV with batch 1
    reads weights once and does little arithmetic; the wins are occupancy, fewer
    launches (CUDA graphs), smaller/half-precision reads, and *coalescing*.
@@ -316,11 +377,22 @@ HY3_SKIP_FFN=1 ...      # isolate FFN cost
 
 ---
 
-## 14. Remaining opportunities
+## 14. Follow-ups (done)
 
-- Remove the now-unused `HY3_SKIP_*` profiling scaffolding and dead device
+The three follow-ups originally listed here are now complete:
+
+- **Done** — removed the `HY3_SKIP_*` profiling scaffolding and the dead device
   functions (`dev_dot_q4_K_sub`, `qwarp_sum_f32`, `dev_dot_q4_K_f32_block`).
-- Overlap the shared-expert GEMV with routed-expert matmuls on a second stream
-  (technique available in the `ds4` reference engine).
-- Investigate a stable-reduction router to extend the correct regime past ~50
-  offloaded layers.
+- **Done** — overlapped the shared-expert GEMV with the routed-expert matmuls on
+  a second stream (Step 9; commit `a696f8f`).
+- **Done** — the router-stability investigation led to the FP32 router GEMV
+  (Step 10; commit `5285365`), which substantially reduces routing divergence.
+
+## 15. Remaining opportunities
+
+- The routed matmuls saturate the SMs, capping stream-overlap gains; a
+  persistent-kernel / megakernel MoE that fuses gate_up→silu→down without
+  round-trips to global memory could recover more.
+- A fully deterministic (fixed-reduction-order) expert matmul would make GPU
+  output bitwise-stable across offload depth, eliminating even the benign
+  phrasing divergence.
