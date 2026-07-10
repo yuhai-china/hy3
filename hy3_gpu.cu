@@ -114,7 +114,8 @@ __global__ void silu_mul_kernel(float*out,const float*g,const float*u,int n){
 }
 /* fused Q/K norm + rope: one block per head (Q heads then K heads) */
 __global__ void qk_norm_rope_fused_kernel(float*q,float*k,const float*qw,const float*kw,
-    int hdim,int nh,int nkh,int pos){
+    int hdim,int nh,int nkh,const int*d_pos){
+    int pos=*d_pos;
     int head=blockIdx.x,iskv=(head>=nh),h=iskv?(head-nh):head;
     float*buf=iskv?k:q,*x=buf+(size_t)h*hdim; const float*w=iskv?kw:qw;
     extern __shared__ float sd[]; int tid=threadIdx.x; float sum=0.f;
@@ -142,9 +143,9 @@ __global__ void norm_router_gemv_fused_kernel(float*rout,const float*x,const flo
 }
 /* online-softmax attention, FP16 KV cache. one warp (32 thr) per head. */
 __global__ void attention_kernel_online(float*out,const float*q,const half*kc,const half*vc,
-    int nh,int nkh,int hdim,int kvlen,int kvg,int lid,int nl){
+    int nh,int nkh,int hdim,const int*d_pos,int kvg,int lid,int nl){
     int h=blockIdx.x; if(h>=nh) return;
-    int kvh=h/kvg,ntok=(kvlen-lid+nl-1)/nl;
+    int kvh=h/kvg,ntok=(*d_pos)+1;
     if(ntok<1) return; if(ntok>8192) ntok=8192;
     const float*qh=q+(size_t)h*hdim,*oh=out+(size_t)h*hdim;
     float scale=rsqrtf((float)hdim); int lane=threadIdx.x&31u;
@@ -175,9 +176,11 @@ __global__ void attention_kernel_online(float*out,const float*q,const half*kc,co
     ((float4*)oh)[lane]=ov;
 }
 /* FP16 KV append */
-__global__ void kv_append_half_kernel(half*kc,half*vc,const float*k,const float*v,int slot,int kvd){
+__global__ void kv_append_half_kernel(half*kc,half*vc,const float*k,const float*v,
+    const int*d_pos,int il,int nl,int kvd){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=kvd) return;
-    size_t off=(size_t)slot*kvd+i; kc[off]=__float2half(k[i]); vc[off]=__float2half(v[i]);
+    size_t slot=(size_t)((*d_pos)*nl+il);
+    size_t off=slot*kvd+i; kc[off]=__float2half(k[i]); vc[off]=__float2half(v[i]);
 }
 __global__ void embed_lookup_kernel(float*out,const float*table,int token,int dim){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<dim) out[i]=table[(size_t)token*dim+i];
@@ -203,6 +206,9 @@ typedef struct {
     float *d_embed,*d_scratch,*d_scratch2,*d_logits;
     int *d_router_ids; float *d_router_wts,*d_moe_gate_k,*d_moe_up_k,*d_moe_mid_k,*d_moe_down_k;
     half *d_xf16;  /* F16 activation scratch for cublasGemmEx (max input dim) */
+    int *d_pos; int *h_pos;      /* device + pinned-host token position for graph replay */
+    cudaGraphExec_t graph_exec; int graph_ready; int graph_warmed;
+    half *graph_kc,*graph_vc;    /* KV cache ptrs baked into graph; realloc -> recapture */
 } gpu_ctx_t;
 
 /* ===== upload ===== */
@@ -310,6 +316,8 @@ int hy3_gpu_init(hy3_model *m,int n_gpu_layers){
     CUDA_CHECK(cudaMalloc(&ctx->d_moe_mid_k,(size_t)HY3_N_EXPERT_USED*HY3_MOE_INTERMED*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ctx->d_moe_down_k,(size_t)HY3_N_EXPERT_USED*HY3_N_EMBD*sizeof(float)));
     { int mx=HY3_DENSE_INTERMED>HY3_N_EMBD?HY3_DENSE_INTERMED:HY3_N_EMBD; CUDA_CHECK(cudaMalloc(&ctx->d_xf16,(size_t)mx*sizeof(half))); }
+    CUDA_CHECK(cudaMalloc(&ctx->d_pos,sizeof(int)));
+    CUDA_CHECK(cudaHostAlloc((void**)&ctx->h_pos,sizeof(int),cudaHostAllocDefault));
     m->gpu_ctx=ctx; fprintf(stderr,"hy3_gpu: initialized (%d layers, FP16 KV, online attn)\n",n_gpu_layers);
     return 0;
 }
@@ -319,7 +327,7 @@ void hy3_gpu_free(hy3_model *m){
     #define GF(p) do{if(p){cudaFree(p);p=NULL;}}while(0)
     GF(ctx->d_token_embd);GF(ctx->d_output_norm);GF(ctx->d_output);
     for(int il=0;il<81;il++){GF(ctx->d_layer_attn_qkv[il]);GF(ctx->d_layer_attn_output[il]);GF(ctx->d_layer_attn_q_norm[il]);GF(ctx->d_layer_attn_k_norm[il]);GF(ctx->d_layer_attn_norm[il]);GF(ctx->d_layer_ffn_norm[il]);GF(ctx->d_layer_ffn_gate_inp[il]);GF(ctx->d_layer_ffn_down_shexp[il]);GF(ctx->d_layer_ffn_gateup_shexp[il]);GF(ctx->d_layer_eh_proj[il]);GF(ctx->d_layer_enorm[il]);GF(ctx->d_layer_hnorm[il]);GF(ctx->d_layer_final_norm[il]);GF(ctx->d_layer_expert_bias[il]);GF(ctx->d_gate_ptrs[il]);GF(ctx->d_up_ptrs[il]);GF(ctx->d_down_ptrs[il]);GF(ctx->d_layer_dense_ffn_gate[il]);GF(ctx->d_layer_dense_ffn_up[il]);GF(ctx->d_layer_dense_ffn_down[il]);for(int e=0;e<HY3_N_EXPERT;e++){GF(ctx->d_q4k_gate_exps[il][e].data);GF(ctx->d_q4k_up_exps[il][e].data);GF(ctx->d_q4k_down_exps[il][e].data);}}
-    GF(ctx->d_k_cache);GF(ctx->d_v_cache);GF(ctx->d_embed);GF(ctx->d_scratch);GF(ctx->d_scratch2);GF(ctx->d_logits);GF(ctx->d_router_ids);GF(ctx->d_router_wts);GF(ctx->d_moe_gate_k);GF(ctx->d_moe_up_k);GF(ctx->d_moe_mid_k);GF(ctx->d_moe_down_k);GF(ctx->d_xf16);
+    GF(ctx->d_k_cache);GF(ctx->d_v_cache);GF(ctx->d_embed);GF(ctx->d_scratch);GF(ctx->d_scratch2);GF(ctx->d_logits);GF(ctx->d_router_ids);GF(ctx->d_router_wts);GF(ctx->d_moe_gate_k);GF(ctx->d_moe_up_k);GF(ctx->d_moe_mid_k);GF(ctx->d_moe_down_k);GF(ctx->d_xf16);GF(ctx->d_pos);if(ctx->h_pos){cudaFreeHost(ctx->h_pos);ctx->h_pos=NULL;}if(ctx->graph_ready)cudaGraphExecDestroy(ctx->graph_exec);
     if(ctx->stream)cudaStreamDestroy(ctx->stream); if(ctx->cublas)cublasDestroy(ctx->cublas);
     free(ctx); m->gpu_ctx=NULL;
 }
@@ -345,30 +353,106 @@ static void gpu_ensure_kv_capacity(gpu_ctx_t*ctx,int ns,int kvd){
     cudaFree(ctx->d_k_cache);cudaFree(ctx->d_v_cache);ctx->d_k_cache=nk;ctx->d_v_cache=nv;ctx->ctx_cap=(int)nc;
 }
 
+/* Encode one GPU-resident layer using ctx->d_pos for all position-dependent
+ * kernels (rope, KV append, attention). No host<->device mirror, no capacity
+ * management -- both handled by the caller outside any capture region. This
+ * is what the CUDA graph captures, and what the full-GPU warmup runs eagerly. */
+static void encode_layer_gpu(gpu_ctx_t*ctx,hy3_model*m,int il){
+    int kvd=HY3_N_KV_HEAD*HY3_HEAD_DIM,qs=HY3_N_HEAD*HY3_HEAD_DIM;
+    float*x=ctx->d_embed,*s=ctx->d_scratch,*s2=ctx->d_scratch+HY3_N_EMBD*2,*ao=ctx->d_scratch+HY3_N_EMBD*4;
+    gpu_rms_norm(ctx,s,x,ctx->d_layer_attn_norm[il],HY3_N_EMBD);
+    float*qg=s2,*kg=s2+qs,*vg=s2+qs+kvd;
+    gpu_mul_mat(ctx,s,s2,ctx->d_layer_attn_qkv[il],qs+2*kvd,HY3_N_EMBD);
+    qk_norm_rope_fused_kernel<<<HY3_N_HEAD+HY3_N_KV_HEAD,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(qg,kg,ctx->d_layer_attn_q_norm[il],ctx->d_layer_attn_k_norm[il],HY3_HEAD_DIM,HY3_N_HEAD,HY3_N_KV_HEAD,ctx->d_pos);
+    kv_append_half_kernel<<<(kvd+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(ctx->d_k_cache,ctx->d_v_cache,kg,vg,ctx->d_pos,il,HY3_N_LAYER,kvd);
+    attention_kernel_online<<<HY3_N_HEAD,32,0,ctx->stream>>>(ao,qg,ctx->d_k_cache,ctx->d_v_cache,HY3_N_HEAD,HY3_N_KV_HEAD,HY3_HEAD_DIM,ctx->d_pos,HY3_N_HEAD/HY3_N_KV_HEAD,il,HY3_N_LAYER);
+    gpu_mul_mat(ctx,ao,s,ctx->d_layer_attn_output[il],HY3_N_EMBD,qs);
+    add_kernel<<<(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(x,x,s,HY3_N_EMBD);
+    if(il<HY3_N_LAYER_DENSE){
+        gpu_rms_norm(ctx,s,x,ctx->d_layer_ffn_norm[il],HY3_N_EMBD);
+        float*g=s2,*u=s2+HY3_DENSE_INTERMED;
+        gpu_mul_mat(ctx,s,g,ctx->d_layer_dense_ffn_gate[il],HY3_DENSE_INTERMED,HY3_N_EMBD);
+        gpu_mul_mat(ctx,s,u,ctx->d_layer_dense_ffn_up[il],HY3_DENSE_INTERMED,HY3_N_EMBD);
+        silu_mul_kernel<<<(HY3_DENSE_INTERMED+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(s2,g,u,HY3_DENSE_INTERMED);
+        gpu_mul_mat(ctx,s2,s,ctx->d_layer_dense_ffn_down[il],HY3_N_EMBD,HY3_DENSE_INTERMED);
+        add_kernel<<<(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(x,x,s,HY3_N_EMBD);
+    } else {
+        int nu=m->n_expert_used;
+        gpu_rms_norm(ctx,s,x,ctx->d_layer_ffn_norm[il],HY3_N_EMBD);
+        gpu_mul_mat(ctx,s,ctx->d_scratch2,ctx->d_layer_ffn_gate_inp[il],HY3_N_EXPERT,HY3_N_EMBD);
+        router_topk_kernel<<<1,256,0,ctx->stream>>>(ctx->d_scratch2,ctx->d_layer_expert_bias[il],ctx->d_router_ids,ctx->d_router_wts,HY3_N_EXPERT,(uint32_t)nu,m->w.layers[il].has_expert_bias?1u:0u,2.826f);
+        float*sg=(float*)ctx->d_scratch2+HY3_N_EXPERT*2,*su=sg+HY3_MOE_INTERMED;
+        gpu_mul_mat(ctx,s,sg,ctx->d_layer_ffn_gateup_shexp[il],2*HY3_MOE_INTERMED,HY3_N_EMBD);
+        silu_mul_kernel<<<(HY3_MOE_INTERMED+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(s2,sg,su,HY3_MOE_INTERMED);
+        int gg=((int)HY3_MOE_INTERMED+511)/512;
+        moe_matmul_q4k_id_gate_up_kernel<<<dim3(gg,nu),256,0,ctx->stream>>>(ctx->d_moe_gate_k,ctx->d_moe_up_k,(const uint8_t*const*)ctx->d_gate_ptrs[il],(const uint8_t*const*)ctx->d_up_ptrs[il],s,ctx->d_router_ids,HY3_N_EMBD,HY3_MOE_INTERMED,0);
+        silu_mul_kernel<<<(nu*HY3_MOE_INTERMED+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(ctx->d_moe_mid_k,ctx->d_moe_gate_k,ctx->d_moe_up_k,nu*HY3_MOE_INTERMED);
+        int gd=((int)HY3_N_EMBD+511)/512;
+        moe_matmul_q4k_id_kernel<<<dim3(gd,nu),256,0,ctx->stream>>>(ctx->d_moe_down_k,(const uint8_t*const*)ctx->d_down_ptrs[il],ctx->d_moe_mid_k,ctx->d_router_ids,HY3_MOE_INTERMED,HY3_N_EMBD,1);
+        gpu_mul_mat(ctx,s2,s,ctx->d_layer_ffn_down_shexp[il],HY3_N_EMBD,HY3_MOE_INTERMED);
+        add_kernel<<<(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(x,x,s,HY3_N_EMBD);
+        moe_combine_id_kernel<<<(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(x,ctx->d_moe_down_k,ctx->d_router_wts,HY3_N_EMBD,(uint32_t)nu);
+    }
+}
+
+/* Capture (once) and replay the full 80-layer forward as a CUDA graph.
+ * Collapses ~1700 host-issued kernel/cuBLAS launches per token into one
+ * graph launch, removing the launch-latency that dominates batch-1 decode. */
+static void gpu_decode_graph(gpu_ctx_t*ctx,hy3_model*m){
+    if(!ctx->graph_ready||ctx->graph_kc!=ctx->d_k_cache||ctx->graph_vc!=ctx->d_v_cache){
+        if(ctx->graph_ready){cudaGraphExecDestroy(ctx->graph_exec);ctx->graph_ready=0;}
+        cudaGraph_t g;
+        CUDA_CHECK(cudaStreamBeginCapture(ctx->stream,cudaStreamCaptureModeThreadLocal));
+        for(int il=0;il<HY3_N_LAYER;il++) encode_layer_gpu(ctx,m,il);
+        CUDA_CHECK(cudaStreamEndCapture(ctx->stream,&g));
+        CUDA_CHECK(cudaGraphInstantiate(&ctx->graph_exec,g,0));
+        cudaGraphDestroy(g);
+        ctx->graph_ready=1; ctx->graph_kc=ctx->d_k_cache; ctx->graph_vc=ctx->d_v_cache;
+        if(getenv("HY3_TIMING")) fprintf(stderr,"hy3_gpu: captured decode graph\n");
+    }
+    CUDA_CHECK(cudaGraphLaunch(ctx->graph_exec,ctx->stream));
+}
+
 int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
     gpu_ctx_t*ctx=(gpu_ctx_t*)m->gpu_ctx; if(!ctx)return -1;
     int kvs=HY3_N_KV_HEAD*HY3_HEAD_DIM,ng=m->gpu_layers;
     if(ng<=0)ng=HY3_N_LAYER; if(ng>HY3_N_LAYER)ng=HY3_N_LAYER;
+    int fg=(ng>=HY3_N_LAYER),kvd=HY3_N_KV_HEAD*HY3_HEAD_DIM;
     for(int i=0;i<tokens->len;i++){
-        int token=tokens->v[i],cb=m->cache_len;
+        int token=tokens->v[i],cb=m->cache_len,tp=cb/HY3_N_LAYER;
         size_t nd=(size_t)(cb+HY3_N_LAYER)*kvs;
         if(nd>(size_t)m->ctx_size*kvs){size_t nc=cb+HY3_N_LAYER+1024;m->cache_k=(float*)realloc(m->cache_k,nc*kvs*sizeof(float));m->cache_v=(float*)realloc(m->cache_v,nc*kvs*sizeof(float));m->ctx_size=(int)nc;}
         if(!m->cache_k){m->ctx_size=4096;m->cache_k=(float*)calloc((size_t)m->ctx_size*kvs,sizeof(float));m->cache_v=(float*)calloc((size_t)m->ctx_size*kvs,sizeof(float));}
         int grid=(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM;
         embed_lookup_kernel<<<grid,BLOCK_DIM,0,ctx->stream>>>(ctx->d_embed,ctx->d_token_embd,token,HY3_N_EMBD);
-        int fg=(ng>=HY3_N_LAYER);
+        /* device-side token position for graph replay */
+        *ctx->h_pos=tp;
+        CUDA_CHECK(cudaMemcpyAsync(ctx->d_pos,ctx->h_pos,sizeof(int),cudaMemcpyHostToDevice,ctx->stream));
+
+        if(fg){
+            /* Full-GPU: ensure KV capacity (host-side, may realloc), then
+             * warmup one token eagerly (so cuBLAS allocs its workspace before
+             * capture) and replay a CUDA graph thereafter. */
+            gpu_ensure_kv_capacity(ctx,cb+HY3_N_LAYER,kvd);
+            if(!ctx->graph_warmed){ for(int il=0;il<HY3_N_LAYER;il++) encode_layer_gpu(ctx,m,il); ctx->graph_warmed=1; }
+            else gpu_decode_graph(ctx,m);
+            m->cache_len=cb+HY3_N_LAYER;
+            continue;
+        }
+
+        /* Partial-GPU: eager, with per-layer KV mirror for the CPU tail. */
         for(int il=0;il<ng;il++){
             if(!ctx->d_layer_attn_qkv[il])break;
-            int kvl=cb+il,kvd=HY3_N_KV_HEAD*HY3_HEAD_DIM,qs=HY3_N_HEAD*HY3_HEAD_DIM,tp=cb/HY3_N_LAYER;
+            int kvl=cb+il,qs=HY3_N_HEAD*HY3_HEAD_DIM;
             float*x=ctx->d_embed,*s=ctx->d_scratch,*s2=ctx->d_scratch+HY3_N_EMBD*2,*ao=ctx->d_scratch+HY3_N_EMBD*4;
             gpu_rms_norm(ctx,s,x,ctx->d_layer_attn_norm[il],HY3_N_EMBD);
             float*qg=s2,*kg=s2+qs,*vg=s2+qs+kvd;
             gpu_mul_mat(ctx,s,s2,ctx->d_layer_attn_qkv[il],qs+2*kvd,HY3_N_EMBD);
-            qk_norm_rope_fused_kernel<<<HY3_N_HEAD+HY3_N_KV_HEAD,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(qg,kg,ctx->d_layer_attn_q_norm[il],ctx->d_layer_attn_k_norm[il],HY3_HEAD_DIM,HY3_N_HEAD,HY3_N_KV_HEAD,tp);
+            qk_norm_rope_fused_kernel<<<HY3_N_HEAD+HY3_N_KV_HEAD,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(qg,kg,ctx->d_layer_attn_q_norm[il],ctx->d_layer_attn_k_norm[il],HY3_HEAD_DIM,HY3_N_HEAD,HY3_N_KV_HEAD,ctx->d_pos);
             gpu_ensure_kv_capacity(ctx,kvl+1,kvd);
-            kv_append_half_kernel<<<(kvd+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(ctx->d_k_cache,ctx->d_v_cache,kg,vg,kvl,kvd);
-            if(!fg){float*hk=m->cache_k+(size_t)kvl*kvd,*hv=m->cache_v+(size_t)kvl*kvd;CUDA_CHECK(cudaMemcpyAsync(hk,kg,kvd*sizeof(float),cudaMemcpyDeviceToHost,ctx->stream));CUDA_CHECK(cudaMemcpyAsync(hv,vg,kvd*sizeof(float),cudaMemcpyDeviceToHost,ctx->stream));}
-            attention_kernel_online<<<HY3_N_HEAD,32,0,ctx->stream>>>(ao,qg,ctx->d_k_cache,ctx->d_v_cache,HY3_N_HEAD,HY3_N_KV_HEAD,HY3_HEAD_DIM,kvl+1,HY3_N_HEAD/HY3_N_KV_HEAD,il,HY3_N_LAYER);
+            kv_append_half_kernel<<<(kvd+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(ctx->d_k_cache,ctx->d_v_cache,kg,vg,ctx->d_pos,il,HY3_N_LAYER,kvd);
+            {float*hk=m->cache_k+(size_t)kvl*kvd,*hv=m->cache_v+(size_t)kvl*kvd;CUDA_CHECK(cudaMemcpyAsync(hk,kg,kvd*sizeof(float),cudaMemcpyDeviceToHost,ctx->stream));CUDA_CHECK(cudaMemcpyAsync(hv,vg,kvd*sizeof(float),cudaMemcpyDeviceToHost,ctx->stream));}
+            attention_kernel_online<<<HY3_N_HEAD,32,0,ctx->stream>>>(ao,qg,ctx->d_k_cache,ctx->d_v_cache,HY3_N_HEAD,HY3_N_KV_HEAD,HY3_HEAD_DIM,ctx->d_pos,HY3_N_HEAD/HY3_N_KV_HEAD,il,HY3_N_LAYER);
             gpu_mul_mat(ctx,ao,s,ctx->d_layer_attn_output[il],HY3_N_EMBD,qs);
             add_kernel<<<(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(x,x,s,HY3_N_EMBD);
             if(il<HY3_N_LAYER_DENSE){
@@ -381,7 +465,6 @@ int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
                 add_kernel<<<(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(x,x,s,HY3_N_EMBD);
             } else {
                 int nu=m->n_expert_used;
-                /* normalized input into s, router logits into d_scratch2 */
                 gpu_rms_norm(ctx,s,x,ctx->d_layer_ffn_norm[il],HY3_N_EMBD);
                 gpu_mul_mat(ctx,s,ctx->d_scratch2,ctx->d_layer_ffn_gate_inp[il],HY3_N_EXPERT,HY3_N_EMBD);
                 router_topk_kernel<<<1,256,0,ctx->stream>>>(ctx->d_scratch2,ctx->d_layer_expert_bias[il],ctx->d_router_ids,ctx->d_router_wts,HY3_N_EXPERT,(uint32_t)nu,m->w.layers[il].has_expert_bias?1u:0u,2.826f);
@@ -399,7 +482,7 @@ int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
             }
         }
         m->cache_len=cb+ng;
-        if(!fg){CUDA_CHECK(cudaMemcpyAsync(m->embed,ctx->d_embed,HY3_N_EMBD*sizeof(float),cudaMemcpyDeviceToHost,ctx->stream));CUDA_CHECK(cudaStreamSynchronize(ctx->stream));for(int il=ng;il<HY3_N_LAYER;il++){int p=cb/HY3_N_LAYER;if(il<HY3_N_LAYER_DENSE)forward_layer_dense(m,il,p);else forward_layer_moe(m,il,p);}CUDA_CHECK(cudaMemcpyAsync(ctx->d_embed,m->embed,HY3_N_EMBD*sizeof(float),cudaMemcpyHostToDevice,ctx->stream));}
+        CUDA_CHECK(cudaMemcpyAsync(m->embed,ctx->d_embed,HY3_N_EMBD*sizeof(float),cudaMemcpyDeviceToHost,ctx->stream));CUDA_CHECK(cudaStreamSynchronize(ctx->stream));for(int il=ng;il<HY3_N_LAYER;il++){int p=cb/HY3_N_LAYER;if(il<HY3_N_LAYER_DENSE)forward_layer_dense(m,il,p);else forward_layer_moe(m,il,p);}CUDA_CHECK(cudaMemcpyAsync(ctx->d_embed,m->embed,HY3_N_EMBD*sizeof(float),cudaMemcpyHostToDevice,ctx->stream));
         m->cache_len=cb+HY3_N_LAYER;
     }
     if(ctx->d_output_norm)gpu_rms_norm(ctx,ctx->d_embed,ctx->d_embed,ctx->d_output_norm,HY3_N_EMBD);
