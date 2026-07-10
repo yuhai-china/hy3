@@ -16,8 +16,7 @@ The project is called **hy3**.
 ## Status
 
 The engine runs on **CPU**, **CUDA** (NVIDIA, `hy3_gpu.cu`), and **Metal**
-(Apple Silicon, `hy3_metal.m`), all verified against the reference
-`transformers` implementation (greedy `11+22+33=?` → `66`).
+(Apple Silicon, `hy3_metal.m`), all verified 
 
 Current best CUDA decode on a single **NVIDIA B300** (Blackwell Ultra), full
 80-layer offload of the ~162GB `hy3_q4k_mixed.gguf`: **~44 tok/s end-to-end
