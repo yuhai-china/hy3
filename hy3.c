@@ -1673,17 +1673,20 @@ void hy3_tokenize(hy3_model *m, const char *text, hy3_tokens *out) {
  *   ASSISTANT THINK_BEGIN THINK_END
  *
  * think controls the reasoning block: 0 = no_think (empty think block, direct
- * answer), 1 = let the model think (only THINK_BEGIN is emitted so generation
- * starts inside the reasoning block). */
+ * answer), 1 = low reasoning effort, 2 = high reasoning effort. For 1/2 only
+ * THINK_BEGIN is emitted so generation starts inside the reasoning block. */
 void hy3_tokenize_chat(hy3_model *m, const char *user_text, int think, hy3_tokens *out) {
+    const char *effort = (think >= 2) ? "reasoning_effort:high"
+                       : (think == 1) ? "reasoning_effort:low"
+                                      : "reasoning_effort:no_think";
     hy3_tokens_push(out, HY3_TOK_BOS);
     hy3_tokens_push(out, HY3_TOK_REASONING_MODE);
-    hy3_tokenize(m, think ? "reasoning_effort:high" : "reasoning_effort:no_think", out);
+    hy3_tokenize(m, effort, out);
     hy3_tokens_push(out, HY3_TOK_USER);
     hy3_tokenize(m, user_text, out);
     hy3_tokens_push(out, HY3_TOK_ASSISTANT);
     hy3_tokens_push(out, HY3_TOK_THINK_BEGIN);
-    if (!think) hy3_tokens_push(out, HY3_TOK_THINK_END);
+    if (think == 0) hy3_tokens_push(out, HY3_TOK_THINK_END);
 }
 
 

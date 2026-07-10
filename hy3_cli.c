@@ -106,7 +106,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -top_p <f>    Top-p sampling (default: 1.0)\n");
     fprintf(stderr, "  -experts <n>  MoE experts per token (1..8, default: 8; lower = faster)\n");
     fprintf(stderr, "  --raw         Feed the prompt as raw text (no chat template)\n");
-    fprintf(stderr, "  --think       Enable the model's reasoning block (default: no_think)\n");
+    fprintf(stderr, "  --think       Enable high reasoning effort\n");
+    fprintf(stderr, "  --think-low   Enable low reasoning effort (shorter chain-of-thought)\n");
     fprintf(stderr, "  --batch <f>   Batch mode: run every prompt line in file <f> (model loads once).\n");
     fprintf(stderr, "                Each line is one prompt with \\n escaped; blank lines skipped.\n");
     fprintf(stderr, "                Output is framed by <<<HY3_BEGIN i>>> ... <<<HY3_END>>> markers.\n");
@@ -132,7 +133,7 @@ int main(int argc, char **argv) {
     int use_metal = 0;
     int n_experts = 0;   /* 0 = leave model default (from HY3_TOP_K_EXPERTS or 8) */
     int raw_prompt = 0;  /* 0 = apply chat template, 1 = feed raw text */
-    int think = 0;       /* reasoning block: 0 = no_think, 1 = think */
+    int think = 0;       /* reasoning block: 0 = no_think, 1 = low, 2 = high */
     const char *batch_file = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -155,6 +156,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--raw") == 0) {
             raw_prompt = 1;
         } else if (strcmp(argv[i], "--think") == 0) {
+            think = 2;
+        } else if (strcmp(argv[i], "--think-low") == 0) {
             think = 1;
         } else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
             batch_file = argv[++i];

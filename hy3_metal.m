@@ -603,6 +603,15 @@ static id<MTLBuffer> hy3_alloc(id<MTLDevice> dev, uint64_t n_floats) {
     return b;
 }
 
+/* Allocate n_halves fp16 elements (KV cache is stored as fp16 to halve memory
+ * and attention read bandwidth; quantization to fp16 is quality-neutral). */
+static id<MTLBuffer> hy3_alloc_half(id<MTLDevice> dev, uint64_t n_halves) {
+    id<MTLBuffer> b = [dev newBufferWithLength:(NSUInteger)(n_halves * sizeof(uint16_t))
+                                        options:MTLResourceStorageModeShared];
+    METAL_CHECK(b != nil, "buffer allocation failed (out of memory?)");
+    return b;
+}
+
 int hy3_metal_init(hy3_model *m) {
     hy3_metal_ctx_t *ctx = (hy3_metal_ctx_t *)calloc(1, sizeof(hy3_metal_ctx_t));
     if (!ctx) return -1;
@@ -712,11 +721,11 @@ int hy3_metal_init(hy3_model *m) {
     }
     uint32_t kv_dim = HY3_N_KV_HEAD * HY3_HEAD_DIM;
     ctx->ctx_cap_slots = default_ctx_tokens * HY3_N_LAYER;
-    ctx->d_k_cache = hy3_alloc(ctx->device, (uint64_t)ctx->ctx_cap_slots * kv_dim);
-    ctx->d_v_cache = hy3_alloc(ctx->device, (uint64_t)ctx->ctx_cap_slots * kv_dim);
-    fprintf(stderr, "hy3_metal: KV cache sized for %d tokens (%d layers x %d slots, %.2f GiB total)\n",
+    ctx->d_k_cache = hy3_alloc_half(ctx->device, (uint64_t)ctx->ctx_cap_slots * kv_dim);
+    ctx->d_v_cache = hy3_alloc_half(ctx->device, (uint64_t)ctx->ctx_cap_slots * kv_dim);
+    fprintf(stderr, "hy3_metal: KV cache sized for %d tokens (%d layers x %d slots, %.2f GiB total, fp16)\n",
             default_ctx_tokens, HY3_N_LAYER, ctx->ctx_cap_slots,
-            2.0 * ctx->ctx_cap_slots * kv_dim * sizeof(float) / 1e9);
+            2.0 * ctx->ctx_cap_slots * kv_dim * sizeof(uint16_t) / 1e9);
 
     m->metal_ctx = ctx;
     fprintf(stderr, "hy3_metal: initialized, all %d layers Metal-resident (zero-copy)\n", HY3_N_LAYER);
@@ -738,15 +747,15 @@ static void hy3_metal_grow_kv_cache(hy3_metal_ctx_t *ctx, int needed_slots) {
     if (needed_slots <= ctx->ctx_cap_slots) return;
     uint32_t kv_dim = HY3_N_KV_HEAD * HY3_HEAD_DIM;
     int new_cap = needed_slots + 8192 * HY3_N_LAYER; /* headroom: ~8192 more tokens */
-    id<MTLBuffer> nk = hy3_alloc(ctx->device, (uint64_t)new_cap * kv_dim);
-    id<MTLBuffer> nv = hy3_alloc(ctx->device, (uint64_t)new_cap * kv_dim);
-    memcpy(nk.contents, ctx->d_k_cache.contents, (size_t)ctx->ctx_cap_slots * kv_dim * sizeof(float));
-    memcpy(nv.contents, ctx->d_v_cache.contents, (size_t)ctx->ctx_cap_slots * kv_dim * sizeof(float));
+    id<MTLBuffer> nk = hy3_alloc_half(ctx->device, (uint64_t)new_cap * kv_dim);
+    id<MTLBuffer> nv = hy3_alloc_half(ctx->device, (uint64_t)new_cap * kv_dim);
+    memcpy(nk.contents, ctx->d_k_cache.contents, (size_t)ctx->ctx_cap_slots * kv_dim * sizeof(uint16_t));
+    memcpy(nv.contents, ctx->d_v_cache.contents, (size_t)ctx->ctx_cap_slots * kv_dim * sizeof(uint16_t));
     ctx->d_k_cache = nk;
     ctx->d_v_cache = nv;
     ctx->ctx_cap_slots = new_cap;
-    fprintf(stderr, "hy3_metal: grew KV cache to %d slots (%.2f GiB each)\n",
-            new_cap, (double)new_cap * kv_dim * sizeof(float) / 1e9);
+    fprintf(stderr, "hy3_metal: grew KV cache to %d slots (%.2f GiB each, fp16)\n",
+            new_cap, (double)new_cap * kv_dim * sizeof(uint16_t) / 1e9);
 }
 
 void hy3_metal_free(hy3_model *m) {

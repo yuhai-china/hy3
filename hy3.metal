@@ -230,8 +230,8 @@ kernel void rope(device float *q [[buffer(0)]],
 // that just wrote d_k/d_v within the same command encoder -- a CPU memcpy
 // at that point would race the GPU and could copy pre-RoPE (or stale)
 // data, since nothing has been committed/waited on yet.
-kernel void kv_cache_write(device float       *k_cache  [[buffer(0)]],
-                            device float       *v_cache  [[buffer(1)]],
+kernel void kv_cache_write(device half        *k_cache  [[buffer(0)]],
+                            device half        *v_cache  [[buffer(1)]],
                             device const float *k        [[buffer(2)]],
                             device const float *v        [[buffer(3)]],
                             constant uint       &kv_size  [[buffer(4)]],
@@ -240,8 +240,8 @@ kernel void kv_cache_write(device float       *k_cache  [[buffer(0)]],
 {
     if (i >= kv_size) return;
     size_t off = (size_t)dst_slot * kv_size + i;
-    k_cache[off] = k[i];
-    v_cache[off] = v[i];
+    k_cache[off] = (half)k[i];
+    v_cache[off] = (half)v[i];
 }
 
 // ---------------------------------------------------------------------
@@ -255,8 +255,8 @@ kernel void kv_cache_write(device float       *k_cache  [[buffer(0)]],
 // ---------------------------------------------------------------------
 kernel void attention(device float       *out      [[buffer(0)]],
                        device const float *q        [[buffer(1)]],
-                       device const float *k_cache  [[buffer(2)]],
-                       device const float *v_cache  [[buffer(3)]],
+                       device const half  *k_cache  [[buffer(2)]],
+                       device const half  *v_cache  [[buffer(3)]],
                        constant uint      &n_heads    [[buffer(4)]],
                        constant uint      &n_kv_heads [[buffer(5)]],
                        constant uint      &head_dim   [[buffer(6)]],
@@ -288,10 +288,10 @@ kernel void attention(device float       *out      [[buffer(0)]],
 
     float local_max = -INFINITY;
     for (int t = (int)tid; t < ntok; t += (int)tgSz) {
-        device const float *k_t = k_cache + (size_t)(t * n_layers + layer_id) * n_kv_heads * head_dim
+        device const half *k_t = k_cache + (size_t)(t * n_layers + layer_id) * n_kv_heads * head_dim
                                            + (size_t)kv_h * head_dim;
         float s = 0.0f;
-        for (uint d = 0; d < head_dim; d++) s += q_h[d] * k_t[d];
+        for (uint d = 0; d < head_dim; d++) s += q_h[d] * (float)k_t[d];
         s *= scale;
         scores[t] = s;
         if (s > local_max) local_max = s;
@@ -324,9 +324,9 @@ kernel void attention(device float       *out      [[buffer(0)]],
     for (uint d = tid; d < head_dim; d += tgSz) {
         float val = 0.0f;
         for (int t = 0; t < ntok; t++) {
-            device const float *v_t = v_cache + (size_t)(t * n_layers + layer_id) * n_kv_heads * head_dim
+            device const half *v_t = v_cache + (size_t)(t * n_layers + layer_id) * n_kv_heads * head_dim
                                                + (size_t)kv_h * head_dim;
-            val += scores[t] * inv * v_t[d];
+            val += scores[t] * inv * (float)v_t[d];
         }
         out_h[d] = val;
     }

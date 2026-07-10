@@ -28,7 +28,7 @@ EXEC_TIMEOUT = 60      # seconds per code execution
 MAX_TOKENS   = 8000    # -n per question
 EXPERTS      = int(os.environ.get("HY3_EVAL_EXPERTS", "8"))  # MoE experts per token
 TEMP         = float(os.environ.get("HY3_EVAL_TEMP", "1.0")) # sampling temperature
-THINK        = True #os.environ.get("HY3_EVAL_THINK", "0") == "1"  # reasoning block
+THINK        = os.environ.get("HY3_EVAL_THINK", "low")       # reasoning: off | low | high
 
 # ─── Code Execution Engine ────────────────────────────────────────────────────
 
@@ -373,9 +373,11 @@ def run_hy3_batch(tests: list) -> list:
 
     cmd = [HY3_CLI, "--metal", "-m", MODEL_PATH,
            "-n", str(MAX_TOKENS), "-temp", str(TEMP),
-           "-experts", str(EXPERTS), "--batch", batch_path]
-    if THINK:
+            "-experts", str(EXPERTS), "--batch", batch_path]
+    if THINK == "high":
         cmd.append("--think")
+    elif THINK == "low":
+        cmd.append("--think-low")
 
     print(f"[hy3] launching: {' '.join(cmd)}")
     print(f"[hy3] loading model (this pays the ~140s cold start once)…")
@@ -504,7 +506,7 @@ def main():
 
     print_summary(results)
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            f"hy3_eval_results_e{EXPERTS}_think{int(THINK)}.json")
+                            f"hy3_eval_results_e{EXPERTS}_think{THINK}.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     print(f"[Saved] {out_path}")
