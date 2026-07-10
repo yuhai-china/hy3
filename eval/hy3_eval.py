@@ -23,12 +23,29 @@ from typing import Optional, Callable
 
 HY3_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HY3_CLI      = os.path.join(HY3_DIR, "hy3-cli")
-MODEL_PATH   = os.path.join(HY3_DIR, "hy3-gguf", "hy3_q4k_mixed.gguf")
+
+def _find_model() -> str:
+    if os.environ.get("HY3_EVAL_MODEL"):
+        return os.environ["HY3_EVAL_MODEL"]
+    candidates = [
+        os.path.join(HY3_DIR, "hy3-gguf", "hy3_q4k_mixed.gguf"),
+        os.path.join(os.path.dirname(HY3_DIR), "hy3-gguf", "hy3_q4k_mixed.gguf"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return candidates[0]
+
+MODEL_PATH   = _find_model()
 EXEC_TIMEOUT = 60      # seconds per code execution
-MAX_TOKENS   = 8000    # -n per question
+MAX_TOKENS   = int(os.environ.get("HY3_EVAL_MAX_TOKENS", "8000"))  # -n per question
 EXPERTS      = int(os.environ.get("HY3_EVAL_EXPERTS", "8"))  # MoE experts per token
 TEMP         = float(os.environ.get("HY3_EVAL_TEMP", "1.0")) # sampling temperature
 THINK        = os.environ.get("HY3_EVAL_THINK", "low")       # reasoning: off | low | high
+# Backend: "cuda" (default, NVIDIA) drives --gpu-layers N; "metal" drives --metal.
+BACKEND      = os.environ.get("HY3_EVAL_BACKEND", "cuda").lower()
+# For CUDA: how many transformer layers to offload to the GPU (80 = full offload).
+GPU_LAYERS   = int(os.environ.get("HY3_EVAL_GPU_LAYERS", "80"))
 
 # ─── Code Execution Engine ────────────────────────────────────────────────────
 
@@ -371,16 +388,25 @@ def run_hy3_batch(tests: list) -> list:
             bf.write(t["prompt"].replace("\\", "\\\\").replace("\n", "\\n") + "\n")
         batch_path = bf.name
 
-    cmd = [HY3_CLI, "--metal", "-m", MODEL_PATH,
+    cmd = [HY3_CLI, "-m", MODEL_PATH,
            "-n", str(MAX_TOKENS), "-temp", str(TEMP),
             "-experts", str(EXPERTS), "--batch", batch_path]
+    if BACKEND == "cuda":
+        cmd += ["--gpu-layers", str(GPU_LAYERS)]
+    elif BACKEND == "metal":
+        cmd.append("--metal")
+    else:
+        sys.exit(f"unknown HY3_EVAL_BACKEND={BACKEND!r} (expected 'cuda' or 'metal')")
     if THINK == "high":
         cmd.append("--think")
     elif THINK == "low":
         cmd.append("--think-low")
 
+    backend_desc = (f"CUDA (--gpu-layers {GPU_LAYERS})" if BACKEND == "cuda"
+                    else "Metal (--metal)")
+    print(f"[hy3] backend: {backend_desc}")
     print(f"[hy3] launching: {' '.join(cmd)}")
-    print(f"[hy3] loading model (this pays the ~140s cold start once)…")
+    print(f"[hy3] loading model (this pays the model cold start once)…")
     print(f"[hy3] hy3-cli stderr (load progress + per-question timing) streams below.\n")
 
     t0 = time.time()
@@ -498,15 +524,16 @@ def main():
     run_ids = sys.argv[1:] or None
     tests = TEST_SUITE if not run_ids else [t for t in TEST_SUITE if t["id"] in run_ids]
 
+    backend_desc = (f"CUDA/gpu-layers={GPU_LAYERS}" if BACKEND == "cuda" else "Metal")
     print(f"\n{'='*72}\n  HY3 Reasoning/Coding Benchmark  |  {len(tests)} questions\n"
-          f"  model: {os.path.basename(MODEL_PATH)}  experts={EXPERTS} temp={TEMP} "
-          f"think={THINK}\n{'='*72}")
+          f"  model: {os.path.basename(MODEL_PATH)}  backend={backend_desc}  "
+          f"experts={EXPERTS} temp={TEMP} think={THINK}\n{'='*72}")
 
     results = run_hy3_batch(tests)
 
     print_summary(results)
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            f"hy3_eval_results_e{EXPERTS}_think{THINK}.json")
+                            f"hy3_eval_results_{BACKEND}_e{EXPERTS}_think{THINK}.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     print(f"[Saved] {out_path}")
