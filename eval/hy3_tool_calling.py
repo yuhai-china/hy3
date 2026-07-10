@@ -51,6 +51,7 @@ BACKEND    = os.environ.get("HY3_TOOL_BACKEND", "cuda").lower()
 GPU_LAYERS = int(os.environ.get("HY3_TOOL_GPU_LAYERS", "80"))
 TEMP       = float(os.environ.get("HY3_TOOL_TEMP", "0.0"))
 MAX_TOKENS = int(os.environ.get("HY3_TOOL_MAX_TOKENS", "512"))
+EXPERTS    = int(os.environ.get("HY3_TOOL_EXPERTS", "8"))  # MoE experts per token
 
 # ─── The tools the model is told it can call ────────────────────────────────────
 
@@ -338,7 +339,7 @@ def run_batch(tests):
         batch_path = bf.name
 
     cmd = [HY3_CLI, "-m", MODEL_PATH, "-n", str(MAX_TOKENS),
-           "-temp", str(TEMP), "-experts", "8", "--batch", batch_path]
+           "-temp", str(TEMP), "-experts", str(EXPERTS), "--batch", batch_path]
     if BACKEND == "cuda":
         cmd += ["--gpu-layers", str(GPU_LAYERS)]
     elif BACKEND == "metal":
@@ -347,7 +348,7 @@ def run_batch(tests):
         sys.exit(f"unknown HY3_TOOL_BACKEND={BACKEND!r}")
     # think is intentionally OFF: no --think / --think-low flag.
 
-    print(f"[hy3] backend: {BACKEND}  think=off  temp={TEMP}  tools={len(TOOLS)}")
+    print(f"[hy3] backend: {BACKEND}  experts={EXPERTS}  think=off  temp={TEMP}  tools={len(TOOLS)}")
     print(f"[hy3] launching: {' '.join(cmd)}")
     print("[hy3] hy3-cli stderr streams below.\n")
 
