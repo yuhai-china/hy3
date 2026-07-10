@@ -42,6 +42,19 @@ __device__ static float dev_dot_q4_K_f32_block(const cuda_block_q4_K*x,const flo
     }
     return sum;
 }
+/* Dot of one Q4_K sub-block (32 elements, sub-block index j in [0,8)) with
+ * y. Lets the warp parallelize a row over its nb*8 sub-blocks (all 32 lanes
+ * busy regardless of nb), instead of one lane per 256-elem block. */
+__device__ static float dev_dot_q4_K_sub(const cuda_block_q4_K*x,uint32_t j,const float*yj){
+    float xd=dev_f16_to_f32(x->d),xmin=dev_f16_to_f32(x->dmin);
+    uint8_t sc,m; dev_q4_K_get_scale_min(j,x->scales,&sc,&m);
+    uint32_t bo=(j>>1u)*32u; int sh=(j&1u)?4:0;
+    const uint8_t*qs=x->qs+bo;
+    float dot=0.f,ys=0.f;
+    #pragma unroll
+    for(uint32_t l=0;l<32u;l++){ dot+=(float)((qs[l]>>sh)&0x0Fu)*yj[l]; ys+=yj[l]; }
+    return (float)sc*xd*dot-(float)m*xmin*ys;
+}
 __device__ static float qwarp_sum_f32(float v){
     uint32_t mask=0xffu<<(threadIdx.x&24u);
     for(int o=4;o>0;o>>=1) v+=__shfl_down_sync(mask,v,o,8);
@@ -74,11 +87,11 @@ __global__ static void moe_matmul_q4k_id_kernel(float*dst,const uint8_t*const*pt
     const float*x,const int*ids,uint32_t n,uint32_t M,uint32_t xps){
     uint32_t slot=blockIdx.y; int eid=ids[slot];
     const uint8_t*w=ptrs[eid]; const float*xs=xps?(x+(uint64_t)slot*n):x;
-    uint32_t warp=threadIdx.x>>5,lane=threadIdx.x&31u,nb=n/CUDA_QK_K;
+    uint32_t warp=threadIdx.x>>5,lane=threadIdx.x&31u,nb=n/CUDA_QK_K,nsub=nb*8u;
     uint32_t row=blockIdx.x*MOE_WPB+warp; if(row>=M) return;
     const cuda_block_q4_K*wr=(const cuda_block_q4_K*)(w+(uint64_t)row*(uint64_t)nb*sizeof(cuda_block_q4_K));
     float acc=0.f;
-    for(uint32_t b=lane;b<nb;b+=32u) acc+=dev_dot_q4_K_f32_block(wr+b,xs+b*CUDA_QK_K);
+    for(uint32_t sb=lane;sb<nsub;sb+=32u) acc+=dev_dot_q4_K_sub(wr+sb/8u,sb&7u,xs+(size_t)(sb/8u)*CUDA_QK_K+(sb&7u)*32u);
     for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffffu,acc,o);
     if(lane==0) dst[(uint64_t)slot*M+row]=acc;
 }
@@ -87,13 +100,13 @@ __global__ static void moe_matmul_q4k_id_gate_up_kernel(float*go,float*uo,
     uint32_t n,uint32_t M,uint32_t xps){
     uint32_t slot=blockIdx.y; int eid=ids[slot];
     const uint8_t*gw=gp[eid],*uw=up[eid]; const float*xs=xps?(x+(uint64_t)slot*n):x;
-    uint32_t warp=threadIdx.x>>5,lane=threadIdx.x&31u,nb=n/CUDA_QK_K;
+    uint32_t warp=threadIdx.x>>5,lane=threadIdx.x&31u,nb=n/CUDA_QK_K,nsub=nb*8u;
     uint32_t row=blockIdx.x*MOE_WPB+warp; if(row>=M) return;
     uint64_t rb=(uint64_t)nb*sizeof(cuda_block_q4_K);
     const cuda_block_q4_K*gr=(const cuda_block_q4_K*)(gw+(uint64_t)row*rb);
     const cuda_block_q4_K*ur=(const cuda_block_q4_K*)(uw+(uint64_t)row*rb);
     float g=0.f,u=0.f;
-    for(uint32_t b=lane;b<nb;b+=32u){ g+=dev_dot_q4_K_f32_block(gr+b,xs+b*CUDA_QK_K); u+=dev_dot_q4_K_f32_block(ur+b,xs+b*CUDA_QK_K); }
+    for(uint32_t sb=lane;sb<nsub;sb+=32u){ uint32_t b=sb/8u,j=sb&7u; const float*yj=xs+(size_t)b*CUDA_QK_K+j*32u; g+=dev_dot_q4_K_sub(gr+b,j,yj); u+=dev_dot_q4_K_sub(ur+b,j,yj); }
     for(int o=16;o>0;o>>=1){ g+=__shfl_down_sync(0xffffffffu,g,o); u+=__shfl_down_sync(0xffffffffu,u,o); }
     if(lane==0){ go[(uint64_t)slot*M+row]=g; uo[(uint64_t)slot*M+row]=u; }
 }
