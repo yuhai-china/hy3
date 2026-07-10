@@ -42,18 +42,34 @@ __device__ static float dev_dot_q4_K_f32_block(const cuda_block_q4_K*x,const flo
     }
     return sum;
 }
-/* Dot of one Q4_K sub-block (32 elements, sub-block index j in [0,8)) with
- * y. Lets the warp parallelize a row over its nb*8 sub-blocks (all 32 lanes
- * busy regardless of nb), instead of one lane per 256-elem block. */
-__device__ static float dev_dot_q4_K_sub(const cuda_block_q4_K*x,uint32_t j,const float*yj){
-    float xd=dev_f16_to_f32(x->d),xmin=dev_f16_to_f32(x->dmin);
-    uint8_t sc,m; dev_q4_K_get_scale_min(j,x->scales,&sc,&m);
-    uint32_t bo=(j>>1u)*32u; int sh=(j&1u)?4:0;
-    const uint8_t*qs=x->qs+bo;
-    float dot=0.f,ys=0.f;
-    #pragma unroll
-    for(uint32_t l=0;l<32u;l++){ dot+=(float)((qs[l]>>sh)&0x0Fu)*yj[l]; ys+=yj[l]; }
-    return (float)sc*xd*dot-(float)m*xmin*ys;
+/* Coalesced warp-cooperative Q4_K row dot: the 32 lanes read each block's
+ * 128-byte qs as 32 contiguous uint32 (one coalesced transaction), lane L
+ * owning byte range [L*4, L*4+3] = pair p=L/8, elements e0=(L%8)*4..+3.
+ * Each lane applies its sub-block scale/min to its 4 low + 4 high nibble
+ * contributions; the caller warp-reduces. This fixes the ~56x-off-bandwidth
+ * uncoalesced access that dominated decode. Returns this lane's partial. */
+__device__ static float warp_row_dot_q4k(const cuda_block_q4_K*wr,const float*xs,uint32_t nb,uint32_t lane){
+    uint32_t p=lane>>3, e0=(lane&7u)*4u;
+    float acc=0.f;
+    for(uint32_t b=0;b<nb;b++){
+        const cuda_block_q4_K*blk=wr+b;
+        float xd=dev_f16_to_f32(blk->d),xmin=dev_f16_to_f32(blk->dmin);
+        uint8_t sc0,m0,sc1,m1;
+        dev_q4_K_get_scale_min(2u*p,blk->scales,&sc0,&m0);
+        dev_q4_K_get_scale_min(2u*p+1u,blk->scales,&sc1,&m1);
+        uint32_t w=((const uint32_t*)blk->qs)[lane];
+        const float*xb=xs+(size_t)b*CUDA_QK_K;
+        const float*xlo=xb+2u*p*32u+e0,*xhi=xb+(2u*p+1u)*32u+e0;
+        float dlo=0.f,dhi=0.f,slo=0.f,shi=0.f;
+        #pragma unroll
+        for(int bi=0;bi<4;bi++){
+            uint32_t byte=(w>>(bi*8))&0xFFu; float xl=xlo[bi],xh=xhi[bi];
+            dlo+=(float)(byte&0xFu)*xl; slo+=xl;
+            dhi+=(float)(byte>>4)*xh;   shi+=xh;
+        }
+        acc+=(float)sc0*xd*dlo-(float)m0*xmin*slo+(float)sc1*xd*dhi-(float)m1*xmin*shi;
+    }
+    return acc;
 }
 __device__ static float qwarp_sum_f32(float v){
     uint32_t mask=0xffu<<(threadIdx.x&24u);
@@ -87,11 +103,10 @@ __global__ static void moe_matmul_q4k_id_kernel(float*dst,const uint8_t*const*pt
     const float*x,const int*ids,uint32_t n,uint32_t M,uint32_t xps){
     uint32_t slot=blockIdx.y; int eid=ids[slot];
     const uint8_t*w=ptrs[eid]; const float*xs=xps?(x+(uint64_t)slot*n):x;
-    uint32_t warp=threadIdx.x>>5,lane=threadIdx.x&31u,nb=n/CUDA_QK_K,nsub=nb*8u;
+    uint32_t warp=threadIdx.x>>5,lane=threadIdx.x&31u,nb=n/CUDA_QK_K;
     uint32_t row=blockIdx.x*MOE_WPB+warp; if(row>=M) return;
     const cuda_block_q4_K*wr=(const cuda_block_q4_K*)(w+(uint64_t)row*(uint64_t)nb*sizeof(cuda_block_q4_K));
-    float acc=0.f;
-    for(uint32_t sb=lane;sb<nsub;sb+=32u) acc+=dev_dot_q4_K_sub(wr+sb/8u,sb&7u,xs+(size_t)(sb/8u)*CUDA_QK_K+(sb&7u)*32u);
+    float acc=warp_row_dot_q4k(wr,xs,nb,lane);
     for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffffu,acc,o);
     if(lane==0) dst[(uint64_t)slot*M+row]=acc;
 }
@@ -100,13 +115,12 @@ __global__ static void moe_matmul_q4k_id_gate_up_kernel(float*go,float*uo,
     uint32_t n,uint32_t M,uint32_t xps){
     uint32_t slot=blockIdx.y; int eid=ids[slot];
     const uint8_t*gw=gp[eid],*uw=up[eid]; const float*xs=xps?(x+(uint64_t)slot*n):x;
-    uint32_t warp=threadIdx.x>>5,lane=threadIdx.x&31u,nb=n/CUDA_QK_K,nsub=nb*8u;
+    uint32_t warp=threadIdx.x>>5,lane=threadIdx.x&31u,nb=n/CUDA_QK_K;
     uint32_t row=blockIdx.x*MOE_WPB+warp; if(row>=M) return;
     uint64_t rb=(uint64_t)nb*sizeof(cuda_block_q4_K);
     const cuda_block_q4_K*gr=(const cuda_block_q4_K*)(gw+(uint64_t)row*rb);
     const cuda_block_q4_K*ur=(const cuda_block_q4_K*)(uw+(uint64_t)row*rb);
-    float g=0.f,u=0.f;
-    for(uint32_t sb=lane;sb<nsub;sb+=32u){ uint32_t b=sb/8u,j=sb&7u; const float*yj=xs+(size_t)b*CUDA_QK_K+j*32u; g+=dev_dot_q4_K_sub(gr+b,j,yj); u+=dev_dot_q4_K_sub(ur+b,j,yj); }
+    float g=warp_row_dot_q4k(gr,xs,nb,lane),u=warp_row_dot_q4k(ur,xs,nb,lane);
     for(int o=16;o>0;o>>=1){ g+=__shfl_down_sync(0xffffffffu,g,o); u+=__shfl_down_sync(0xffffffffu,u,o); }
     if(lane==0){ go[(uint64_t)slot*M+row]=g; uo[(uint64_t)slot*M+row]=u; }
 }
