@@ -190,18 +190,19 @@ __global__ void add_kernel(float*out,const float*a,const float*b,int n){
 typedef struct { uint8_t*data; int bytes; } q4k_buf_t;
 typedef struct {
     cublasHandle_t cublas; cudaStream_t stream;
-    float *d_token_embd,*d_output_norm,*d_output;
-    float *d_layer_attn_qkv[81],*d_layer_attn_output[81];
+    float *d_token_embd,*d_output_norm; half *d_output;   /* d_output: FP16 GEMV */
+    half  *d_layer_attn_qkv[81],*d_layer_attn_output[81]; /* FP16 GEMV weights */
     float *d_layer_attn_q_norm[81],*d_layer_attn_k_norm[81],*d_layer_attn_norm[81],*d_layer_ffn_norm[81];
-    float *d_layer_ffn_gate_inp[81],*d_layer_ffn_down_shexp[81],*d_layer_ffn_gateup_shexp[81];
+    half  *d_layer_ffn_gate_inp[81],*d_layer_ffn_down_shexp[81],*d_layer_ffn_gateup_shexp[81];
     float *d_layer_eh_proj[81],*d_layer_enorm[81],*d_layer_hnorm[81],*d_layer_final_norm[81];
     float *d_layer_expert_bias[81];
-    float *d_layer_dense_ffn_gate[81],*d_layer_dense_ffn_up[81],*d_layer_dense_ffn_down[81];
+    half  *d_layer_dense_ffn_gate[81],*d_layer_dense_ffn_up[81],*d_layer_dense_ffn_down[81];
     q4k_buf_t d_q4k_gate_exps[81][192],d_q4k_up_exps[81][192],d_q4k_down_exps[81][192];
     uint8_t **d_gate_ptrs[81],**d_up_ptrs[81],**d_down_ptrs[81];
     half *d_k_cache,*d_v_cache; int ctx_cap;
     float *d_embed,*d_scratch,*d_scratch2,*d_logits;
     int *d_router_ids; float *d_router_wts,*d_moe_gate_k,*d_moe_up_k,*d_moe_mid_k,*d_moe_down_k;
+    half *d_xf16;  /* F16 activation scratch for cublasGemmEx (max input dim) */
 } gpu_ctx_t;
 
 /* ===== upload ===== */
@@ -222,6 +223,23 @@ static float *upload_weight_dense(const hy3_weight*w){
     if(!w||!w->data||!w->t)return NULL; const hy3_tensor_info*t=w->t; uint64_t n=t->elements; if(n==0)return NULL;
     switch(t->ggml_type){case 0:return upload_f32(w->data,n);case 1:return upload_f16(w->data,n);case 8:return upload_q8_0(w->data,n);case 12:return upload_q4k_dense(w->data,n);default:{float*b;CUDA_CHECK(cudaMalloc(&b,n*sizeof(float)));CUDA_CHECK(cudaMemset(b,0,n*sizeof(float)));return b;}}
 }
+/* Convert an F32 device buffer to F16 (frees the F32), for cuBLAS FP16
+ * tensor-core GEMV (cublasGemmEx). Halves weight bandwidth (GEMVs are
+ * memory-bound at batch-1) and roughly doubles throughput on Blackwell. */
+__global__ void f32_to_f16_conv_kernel(half*dst,const float*src,uint64_t n){
+    uint64_t i=(uint64_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<n) dst[i]=__float2half(src[i]);
+}
+static half *convert_to_half_free(float *f32, uint64_t n){
+    if(!f32||n==0)return NULL;
+    half*h; CUDA_CHECK(cudaMalloc(&h,n*sizeof(half)));
+    f32_to_f16_conv_kernel<<<(int)((n+255u)/256u),256>>>(h,f32,n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaFree(f32); return h;
+}
+static half *upload_weight_half(const hy3_weight*w){
+    float *f32=upload_weight_dense(w); if(!f32)return NULL;
+    return convert_to_half_free(f32,w->t->elements);
+}
 
 #ifdef __cplusplus
 extern "C" {
@@ -234,19 +252,20 @@ int hy3_gpu_init(hy3_model *m,int n_gpu_layers){
     CUBLAS_CHECK(cublasSetMathMode(ctx->cublas,CUBLAS_TF32_TENSOR_OP_MATH));
     ctx->d_token_embd=upload_weight_dense(&m->w.token_embd);
     ctx->d_output_norm=upload_weight_dense(&m->w.output_norm);
-    ctx->d_output=upload_weight_dense(&m->w.output);
+    ctx->d_output=upload_weight_half(&m->w.output);
     if(n_gpu_layers<=0)n_gpu_layers=81; if(n_gpu_layers>81)n_gpu_layers=81; m->gpu_layers=n_gpu_layers;
     for(int il=0;il<n_gpu_layers;il++){
         hy3_layer_weights*l=&m->w.layers[il];
         ctx->d_layer_attn_norm[il]=upload_weight_dense(&l->attn_norm);
         { float*q=upload_weight_dense(&l->attn_q),*k=upload_weight_dense(&l->attn_k),*v=upload_weight_dense(&l->attn_v);
           size_t qn=(size_t)HY3_N_HEAD*HY3_HEAD_DIM*HY3_N_EMBD,kn=(size_t)HY3_N_KV_HEAD*HY3_HEAD_DIM*HY3_N_EMBD;
-          CUDA_CHECK(cudaMalloc(&ctx->d_layer_attn_qkv[il],(qn+2*kn)*sizeof(float)));
-          CUDA_CHECK(cudaMemcpy(ctx->d_layer_attn_qkv[il],q,qn*sizeof(float),cudaMemcpyDeviceToDevice));
-          CUDA_CHECK(cudaMemcpy(ctx->d_layer_attn_qkv[il]+qn,k,kn*sizeof(float),cudaMemcpyDeviceToDevice));
-          CUDA_CHECK(cudaMemcpy(ctx->d_layer_attn_qkv[il]+qn+kn,v,kn*sizeof(float),cudaMemcpyDeviceToDevice));
-          cudaFree(q);cudaFree(k);cudaFree(v); }
-        ctx->d_layer_attn_output[il]=upload_weight_dense(&l->attn_output);
+          float *qkv; CUDA_CHECK(cudaMalloc(&qkv,(qn+2*kn)*sizeof(float)));
+          CUDA_CHECK(cudaMemcpy(qkv,q,qn*sizeof(float),cudaMemcpyDeviceToDevice));
+          CUDA_CHECK(cudaMemcpy(qkv+qn,k,kn*sizeof(float),cudaMemcpyDeviceToDevice));
+          CUDA_CHECK(cudaMemcpy(qkv+qn+kn,v,kn*sizeof(float),cudaMemcpyDeviceToDevice));
+          cudaFree(q);cudaFree(k);cudaFree(v);
+          ctx->d_layer_attn_qkv[il]=convert_to_half_free(qkv,qn+2*kn); }
+        ctx->d_layer_attn_output[il]=upload_weight_half(&l->attn_output);
         ctx->d_layer_attn_q_norm[il]=upload_weight_dense(&l->attn_q_norm);
         ctx->d_layer_attn_k_norm[il]=upload_weight_dense(&l->attn_k_norm);
         ctx->d_layer_ffn_norm[il]=upload_weight_dense(&l->ffn_norm);
@@ -255,18 +274,19 @@ int hy3_gpu_init(hy3_model *m,int n_gpu_layers){
         ctx->d_layer_hnorm[il]=upload_weight_dense(&l->hnorm);
         ctx->d_layer_final_norm[il]=upload_weight_dense(&l->final_norm);
         if(il<HY3_N_LAYER_DENSE){
-            ctx->d_layer_dense_ffn_gate[il]=upload_weight_dense(&l->ffn_gate);
-            ctx->d_layer_dense_ffn_up[il]=upload_weight_dense(&l->ffn_up);
-            ctx->d_layer_dense_ffn_down[il]=upload_weight_dense(&l->ffn_down);
+            ctx->d_layer_dense_ffn_gate[il]=upload_weight_half(&l->ffn_gate);
+            ctx->d_layer_dense_ffn_up[il]=upload_weight_half(&l->ffn_up);
+            ctx->d_layer_dense_ffn_down[il]=upload_weight_half(&l->ffn_down);
         } else {
-            ctx->d_layer_ffn_gate_inp[il]=upload_weight_dense(&l->ffn_gate_inp);
-            ctx->d_layer_ffn_down_shexp[il]=upload_weight_dense(&l->ffn_down_shexp);
+            ctx->d_layer_ffn_gate_inp[il]=upload_weight_half(&l->ffn_gate_inp);
+            ctx->d_layer_ffn_down_shexp[il]=upload_weight_half(&l->ffn_down_shexp);
             { float*g=upload_weight_dense(&l->ffn_gate_shexp),*u=upload_weight_dense(&l->ffn_up_shexp);
               size_t gm=(size_t)HY3_MOE_INTERMED*HY3_N_EMBD;
-              CUDA_CHECK(cudaMalloc(&ctx->d_layer_ffn_gateup_shexp[il],2*gm*sizeof(float)));
-              CUDA_CHECK(cudaMemcpy(ctx->d_layer_ffn_gateup_shexp[il],g,gm*sizeof(float),cudaMemcpyDeviceToDevice));
-              CUDA_CHECK(cudaMemcpy(ctx->d_layer_ffn_gateup_shexp[il]+gm,u,gm*sizeof(float),cudaMemcpyDeviceToDevice));
-              cudaFree(g);cudaFree(u); }
+              float *gu; CUDA_CHECK(cudaMalloc(&gu,2*gm*sizeof(float)));
+              CUDA_CHECK(cudaMemcpy(gu,g,gm*sizeof(float),cudaMemcpyDeviceToDevice));
+              CUDA_CHECK(cudaMemcpy(gu+gm,u,gm*sizeof(float),cudaMemcpyDeviceToDevice));
+              cudaFree(g);cudaFree(u);
+              ctx->d_layer_ffn_gateup_shexp[il]=convert_to_half_free(gu,2*gm); }
             if(l->has_expert_bias){CUDA_CHECK(cudaMalloc(&ctx->d_layer_expert_bias[il],HY3_N_EXPERT*sizeof(float)));CUDA_CHECK(cudaMemcpy(ctx->d_layer_expert_bias[il],l->expert_bias,HY3_N_EXPERT*sizeof(float),cudaMemcpyHostToDevice));}
             for(int e=0;e<HY3_N_EXPERT;e++){upload_q4k_compressed(&ctx->d_q4k_gate_exps[il][e],l->ffn_gate_exps[e].data,l->ffn_gate_exps[e].t->elements);upload_q4k_compressed(&ctx->d_q4k_up_exps[il][e],l->ffn_up_exps[e].data,l->ffn_up_exps[e].t->elements);upload_q4k_compressed(&ctx->d_q4k_down_exps[il][e],l->ffn_down_exps[e].data,l->ffn_down_exps[e].t->elements);}
             { uint8_t*hg[192],*hu[192],*hd[192];
@@ -289,6 +309,7 @@ int hy3_gpu_init(hy3_model *m,int n_gpu_layers){
     CUDA_CHECK(cudaMalloc(&ctx->d_moe_up_k,(size_t)HY3_N_EXPERT_USED*HY3_MOE_INTERMED*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ctx->d_moe_mid_k,(size_t)HY3_N_EXPERT_USED*HY3_MOE_INTERMED*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ctx->d_moe_down_k,(size_t)HY3_N_EXPERT_USED*HY3_N_EMBD*sizeof(float)));
+    { int mx=HY3_DENSE_INTERMED>HY3_N_EMBD?HY3_DENSE_INTERMED:HY3_N_EMBD; CUDA_CHECK(cudaMalloc(&ctx->d_xf16,(size_t)mx*sizeof(half))); }
     m->gpu_ctx=ctx; fprintf(stderr,"hy3_gpu: initialized (%d layers, FP16 KV, online attn)\n",n_gpu_layers);
     return 0;
 }
@@ -298,13 +319,21 @@ void hy3_gpu_free(hy3_model *m){
     #define GF(p) do{if(p){cudaFree(p);p=NULL;}}while(0)
     GF(ctx->d_token_embd);GF(ctx->d_output_norm);GF(ctx->d_output);
     for(int il=0;il<81;il++){GF(ctx->d_layer_attn_qkv[il]);GF(ctx->d_layer_attn_output[il]);GF(ctx->d_layer_attn_q_norm[il]);GF(ctx->d_layer_attn_k_norm[il]);GF(ctx->d_layer_attn_norm[il]);GF(ctx->d_layer_ffn_norm[il]);GF(ctx->d_layer_ffn_gate_inp[il]);GF(ctx->d_layer_ffn_down_shexp[il]);GF(ctx->d_layer_ffn_gateup_shexp[il]);GF(ctx->d_layer_eh_proj[il]);GF(ctx->d_layer_enorm[il]);GF(ctx->d_layer_hnorm[il]);GF(ctx->d_layer_final_norm[il]);GF(ctx->d_layer_expert_bias[il]);GF(ctx->d_gate_ptrs[il]);GF(ctx->d_up_ptrs[il]);GF(ctx->d_down_ptrs[il]);GF(ctx->d_layer_dense_ffn_gate[il]);GF(ctx->d_layer_dense_ffn_up[il]);GF(ctx->d_layer_dense_ffn_down[il]);for(int e=0;e<HY3_N_EXPERT;e++){GF(ctx->d_q4k_gate_exps[il][e].data);GF(ctx->d_q4k_up_exps[il][e].data);GF(ctx->d_q4k_down_exps[il][e].data);}}
-    GF(ctx->d_k_cache);GF(ctx->d_v_cache);GF(ctx->d_embed);GF(ctx->d_scratch);GF(ctx->d_scratch2);GF(ctx->d_logits);GF(ctx->d_router_ids);GF(ctx->d_router_wts);GF(ctx->d_moe_gate_k);GF(ctx->d_moe_up_k);GF(ctx->d_moe_mid_k);GF(ctx->d_moe_down_k);
+    GF(ctx->d_k_cache);GF(ctx->d_v_cache);GF(ctx->d_embed);GF(ctx->d_scratch);GF(ctx->d_scratch2);GF(ctx->d_logits);GF(ctx->d_router_ids);GF(ctx->d_router_wts);GF(ctx->d_moe_gate_k);GF(ctx->d_moe_up_k);GF(ctx->d_moe_mid_k);GF(ctx->d_moe_down_k);GF(ctx->d_xf16);
     if(ctx->stream)cudaStreamDestroy(ctx->stream); if(ctx->cublas)cublasDestroy(ctx->cublas);
     free(ctx); m->gpu_ctx=NULL;
 }
 
-static void gpu_mul_mat(gpu_ctx_t*ctx,const float*x,float*dst,const float*w,int m,int n){
-    float a=1.f,b=0.f; cublasSgemm(ctx->cublas,CUBLAS_OP_T,CUBLAS_OP_N,m,1,n,&a,w,n,x,n,&b,dst,m);
+/* FP16 GEMV via cuBLAS tensor cores: convert activation to F16, then
+ * W(F16) x(F16) -> dst(F32), F32 accumulate. ~2x plain TF32 SGEMM for
+ * these skinny batch-1 GEMVs (halves weight bandwidth; they're mem-bound). */
+__global__ void f2h_vec_kernel(half*d,const float*s,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)d[i]=__float2half(s[i]);}
+static void gpu_mul_mat(gpu_ctx_t*ctx,const float*x,float*dst,const half*w,int m,int n){
+    f2h_vec_kernel<<<(n+255)/256,256,0,ctx->stream>>>(ctx->d_xf16,x,n);
+    float a=1.f,b=0.f;
+    cublasGemmEx(ctx->cublas,CUBLAS_OP_T,CUBLAS_OP_N,m,1,n,&a,
+                 w,CUDA_R_16F,n, ctx->d_xf16,CUDA_R_16F,n, &b, dst,CUDA_R_32F,m,
+                 CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
 }
 static void gpu_rms_norm(gpu_ctx_t*ctx,float*o,const float*x,const float*w,int n){
     rms_norm_kernel<<<1,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(o,x,w,n);
