@@ -212,6 +212,8 @@ __global__ void add_kernel(float*out,const float*a,const float*b,int n){
 typedef struct { uint8_t*data; int bytes; } q4k_buf_t;
 typedef struct {
     cublasHandle_t cublas; cudaStream_t stream;
+    cudaStream_t stream2;            /* routed-expert matmuls, overlapped w/ shared GEMV */
+    cudaEvent_t ev_fork,ev_join;     /* fork/join for multi-stream graph capture */
     float *d_token_embd,*d_output_norm; half *d_output;   /* d_output: FP16 GEMV */
     half  *d_layer_attn_qkv[81],*d_layer_attn_output[81]; /* FP16 GEMV weights */
     float *d_layer_attn_q_norm[81],*d_layer_attn_k_norm[81],*d_layer_attn_norm[81],*d_layer_ffn_norm[81];
@@ -273,6 +275,9 @@ extern "C" {
 int hy3_gpu_init(hy3_model *m,int n_gpu_layers){
     gpu_ctx_t*ctx=(gpu_ctx_t*)calloc(1,sizeof(gpu_ctx_t)); if(!ctx)return -1;
     CUBLAS_CHECK(cublasCreate(&ctx->cublas)); CUDA_CHECK(cudaStreamCreate(&ctx->stream));
+    CUDA_CHECK(cudaStreamCreate(&ctx->stream2));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ctx->ev_fork,cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ctx->ev_join,cudaEventDisableTiming));
     CUBLAS_CHECK(cublasSetStream(ctx->cublas,ctx->stream));
     CUBLAS_CHECK(cublasSetMathMode(ctx->cublas,CUBLAS_TF32_TENSOR_OP_MATH));
     ctx->d_token_embd=upload_weight_dense(&m->w.token_embd);
@@ -347,6 +352,8 @@ void hy3_gpu_free(hy3_model *m){
     GF(ctx->d_token_embd);GF(ctx->d_output_norm);GF(ctx->d_output);
     for(int il=0;il<81;il++){GF(ctx->d_layer_attn_qkv[il]);GF(ctx->d_layer_attn_output[il]);GF(ctx->d_layer_attn_q_norm[il]);GF(ctx->d_layer_attn_k_norm[il]);GF(ctx->d_layer_attn_norm[il]);GF(ctx->d_layer_ffn_norm[il]);GF(ctx->d_layer_ffn_gate_inp[il]);GF(ctx->d_layer_ffn_down_shexp[il]);GF(ctx->d_layer_ffn_gateup_shexp[il]);GF(ctx->d_layer_eh_proj[il]);GF(ctx->d_layer_enorm[il]);GF(ctx->d_layer_hnorm[il]);GF(ctx->d_layer_final_norm[il]);GF(ctx->d_layer_expert_bias[il]);GF(ctx->d_gate_ptrs[il]);GF(ctx->d_up_ptrs[il]);GF(ctx->d_down_ptrs[il]);GF(ctx->d_layer_dense_ffn_gate[il]);GF(ctx->d_layer_dense_ffn_up[il]);GF(ctx->d_layer_dense_ffn_down[il]);for(int e=0;e<HY3_N_EXPERT;e++){GF(ctx->d_q4k_gate_exps[il][e].data);GF(ctx->d_q4k_up_exps[il][e].data);GF(ctx->d_q4k_down_exps[il][e].data);}}
     GF(ctx->d_k_cache);GF(ctx->d_v_cache);GF(ctx->d_embed);GF(ctx->d_scratch);GF(ctx->d_scratch2);GF(ctx->d_logits);GF(ctx->d_router_ids);GF(ctx->d_router_wts);GF(ctx->d_moe_gate_k);GF(ctx->d_moe_up_k);GF(ctx->d_moe_mid_k);GF(ctx->d_moe_down_k);GF(ctx->d_xf16);GF(ctx->d_pos);if(ctx->h_pos){cudaFreeHost(ctx->h_pos);ctx->h_pos=NULL;}if(ctx->graph_ready)cudaGraphExecDestroy(ctx->graph_exec);
+    if(ctx->ev_fork)cudaEventDestroy(ctx->ev_fork); if(ctx->ev_join)cudaEventDestroy(ctx->ev_join);
+    if(ctx->stream2)cudaStreamDestroy(ctx->stream2);
     if(ctx->stream)cudaStreamDestroy(ctx->stream); if(ctx->cublas)cublasDestroy(ctx->cublas);
     free(ctx); m->gpu_ctx=NULL;
 }
@@ -399,16 +406,24 @@ static void encode_layer_gpu(gpu_ctx_t*ctx,hy3_model*m,int il){
         int nu=m->n_expert_used;
         gpu_mul_mat(ctx,s,ctx->d_scratch2,ctx->d_layer_ffn_gate_inp[il],HY3_N_EXPERT,HY3_N_EMBD);
         router_topk_kernel<<<1,256,0,ctx->stream>>>(ctx->d_scratch2,ctx->d_layer_expert_bias[il],ctx->d_router_ids,ctx->d_router_wts,HY3_N_EXPERT,(uint32_t)nu,m->w.layers[il].has_expert_bias?1u:0u,2.826f);
+        /* Fork: the routed-expert Q4_K matmuls (which dominate the layer) run on
+         * stream2 while the small shared-expert FP16 GEMVs run on the main
+         * stream. Both read s read-only; shared-down writes ao (not s) to avoid a
+         * WAR hazard with the routed gate_up read of s. Joined before combine. */
+        CUDA_CHECK(cudaEventRecord(ctx->ev_fork,ctx->stream));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx->stream2,ctx->ev_fork,0));
+        int gg=(HY3_MOE_INTERMED+MOE_WPB-1)/MOE_WPB;
+        moe_matmul_q4k_id_gate_up_kernel<<<dim3(gg,nu),256,0,ctx->stream2>>>(ctx->d_moe_gate_k,ctx->d_moe_up_k,(const uint8_t*const*)ctx->d_gate_ptrs[il],(const uint8_t*const*)ctx->d_up_ptrs[il],s,ctx->d_router_ids,HY3_N_EMBD,HY3_MOE_INTERMED,0);
+        silu_mul_kernel<<<(nu*HY3_MOE_INTERMED+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream2>>>(ctx->d_moe_mid_k,ctx->d_moe_gate_k,ctx->d_moe_up_k,nu*HY3_MOE_INTERMED);
+        int gd=(HY3_N_EMBD+MOE_WPB-1)/MOE_WPB;
+        moe_matmul_q4k_id_kernel<<<dim3(gd,nu),256,0,ctx->stream2>>>(ctx->d_moe_down_k,(const uint8_t*const*)ctx->d_down_ptrs[il],ctx->d_moe_mid_k,ctx->d_router_ids,HY3_MOE_INTERMED,HY3_N_EMBD,1);
+        CUDA_CHECK(cudaEventRecord(ctx->ev_join,ctx->stream2));
         float*sg=(float*)ctx->d_scratch2+HY3_N_EXPERT*2,*su=sg+HY3_MOE_INTERMED;
         gpu_mul_mat(ctx,s,sg,ctx->d_layer_ffn_gateup_shexp[il],2*HY3_MOE_INTERMED,HY3_N_EMBD);
         silu_mul_kernel<<<(HY3_MOE_INTERMED+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(s2,sg,su,HY3_MOE_INTERMED);
-        int gg=(HY3_MOE_INTERMED+MOE_WPB-1)/MOE_WPB;
-        moe_matmul_q4k_id_gate_up_kernel<<<dim3(gg,nu),256,0,ctx->stream>>>(ctx->d_moe_gate_k,ctx->d_moe_up_k,(const uint8_t*const*)ctx->d_gate_ptrs[il],(const uint8_t*const*)ctx->d_up_ptrs[il],s,ctx->d_router_ids,HY3_N_EMBD,HY3_MOE_INTERMED,0);
-        silu_mul_kernel<<<(nu*HY3_MOE_INTERMED+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(ctx->d_moe_mid_k,ctx->d_moe_gate_k,ctx->d_moe_up_k,nu*HY3_MOE_INTERMED);
-        int gd=(HY3_N_EMBD+MOE_WPB-1)/MOE_WPB;
-        moe_matmul_q4k_id_kernel<<<dim3(gd,nu),256,0,ctx->stream>>>(ctx->d_moe_down_k,(const uint8_t*const*)ctx->d_down_ptrs[il],ctx->d_moe_mid_k,ctx->d_router_ids,HY3_MOE_INTERMED,HY3_N_EMBD,1);
-        gpu_mul_mat(ctx,s2,s,ctx->d_layer_ffn_down_shexp[il],HY3_N_EMBD,HY3_MOE_INTERMED);
-        add_kernel<<<(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(x,x,s,HY3_N_EMBD);
+        gpu_mul_mat(ctx,s2,ao,ctx->d_layer_ffn_down_shexp[il],HY3_N_EMBD,HY3_MOE_INTERMED);
+        add_kernel<<<(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(x,x,ao,HY3_N_EMBD);
+        CUDA_CHECK(cudaStreamWaitEvent(ctx->stream,ctx->ev_join,0));
         moe_combine_id_kernel<<<(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(x,ctx->d_moe_down_k,ctx->d_router_wts,HY3_N_EMBD,(uint32_t)nu);
     }
 }
