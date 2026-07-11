@@ -1,5 +1,7 @@
 # hy3 — tencent/Hy3 GGUF Converter and Inference Engine
 
+![hy3](hy3.png)
+
 `hy3` is a from-scratch C inference engine and GGUF converter for **tencent/Hy3**
 (`HYV3ForCausalLM`, `model_type: hy_v3`), a 295B-parameter / 21B-active-parameter
 Mixture-of-Experts model released by **Tencent's Hunyuan ("Hy") team**
