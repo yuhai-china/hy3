@@ -15,43 +15,15 @@ The project is called **hy3**.
 
 ## Status
 
-The engine runs on **CPU**, **CUDA** (NVIDIA, `hy3_gpu.cu`), and **Metal**
-(Apple Silicon, `hy3_metal.m`), all verified.
+Supports **CPU**, **CUDA**, and **Metal**. All verified.
 
-### B300 CUDA performance
+On a single **NVIDIA B300** (80-layer GPU offload, ~162 GB GGUF):
+decode reaches **~50 tok/s** end-to-end, flat across context length.
 
-Single **NVIDIA B300** (Blackwell Ultra), full 80-layer offload of the ~162 GB
-`hy3_q4k_mixed.gguf`, measured end-to-end on real multi-hundred-token generations
-(including sampling/detokenization/host overhead):
+On **M2 Ultra** (192 GB): ~22 tok/s after split-KV.
 
-| Metric | Value |
-|---|---|
-| Sustained decode | **~47–53 tok/s** (flat across context, no degradation) |
-| Prefill (prompt processing) | **~35–45 tok/s** |
-| Graph-replay ceiling (pure-GPU kernel time) | **~18.7 ms/token (~53 tok/s)** |
-| Model load (prefault 162 GB) | **~12 s** (once) |
-
-Decode speed no longer degrades with context length (split-KV / FlashDecoding
-attention, commit `3c09a01`). Up from a ~4.6 tok/s starting point; the full
-step-by-step optimization history lives in dedicated docs:
-
-- **[`docs/CUDA_OPTIMIZATION.md`](docs/CUDA_OPTIMIZATION.md)** — CUDA decode
-  4.6 → ~53 tok/s (also [`docs/CUDA_OPTIMIZATION.zh.md`](docs/CUDA_OPTIMIZATION.zh.md), 中文).
-- **[`docs/METAL_OPTIMIZATION.md`](docs/METAL_OPTIMIZATION.md)** — Metal backend
-  optimization notes, the same split-KV attention port, and follow-up suggestions.
-
-### Apple Silicon Metal performance
-
-Single **M2 Ultra** (192 GB unified memory), full offload of the same ~162 GB
-`hy3_q4k_mixed.gguf`, end-to-end on real generations:
-
-| Metric | Before | After (split-KV) | Gain |
-|---|---|---|---|
-| Generation (decode) | 10.1 tok/s | **22.2 tok/s** | **+120% (2.2×)** |
-| Prefill (prompt) | 19.9 tok/s | 23.2 tok/s | +17% |
-
-Same split-KV / FlashDecoding attention technique as CUDA (commit `2db386c`),
-ported to Metal (`hy3.metal`, `hy3_metal.m`).
+Full optimization history → [`docs/CUDA_OPTIMIZATION.md`](docs/CUDA_OPTIMIZATION.md)
+([中文](docs/CUDA_OPTIMIZATION.zh.md)) and [`docs/METAL_OPTIMIZATION.md`](docs/METAL_OPTIMIZATION.md).
 
 > **Build note (CUDA):** use the plain `sm_90`/`sm_100`/`compute_100` nvcc arch
 > flags the Makefile ships with. The `-a`-suffixed variants (`sm_90a`,
