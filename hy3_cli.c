@@ -16,6 +16,18 @@ int hy3_metal_init(hy3_model *m);
 
 static int emit_token(void *ud, int token) {
     hy3_model *m = (hy3_model *)ud;
+    static int color_checked = 0, use_color = 0;
+    if (!color_checked) { color_checked = 1; use_color = isatty(STDOUT_FILENO); }
+    if (token == 120029) { /* <think:opensource> */
+        if (use_color) fwrite("\033[32m", 1, 5, stdout);
+        fflush(stdout);
+        return 0;
+    }
+    if (token == 120030) { /* </think:opensource> */
+        if (use_color) fwrite("\033[0m\n", 1, 5, stdout);
+        fflush(stdout);
+        return 0;
+    }
     char buf[256];
     int n = hy3_detokenize(m, token, buf, sizeof(buf));
     if (n > 0) fwrite(buf, 1, n, stdout);
