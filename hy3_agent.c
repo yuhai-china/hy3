@@ -32,7 +32,7 @@ int hy3_gpu_init(hy3_model *m, int n_gpu_layers);
  * ============================================================================ */
 
 #define AGENT_MAX_TOKENS   4096
-#define AGENT_TEMP          0.7f
+#define AGENT_TEMP          0.0f    /* greedy: deterministic, correct for tool calls */
 #define AGENT_READ_CHUNK    500
 #define AGENT_BASH_TIMEOUT   60
 #define AGENT_MAX_TURNS      16
@@ -64,43 +64,108 @@ static void sb_putc(strbuf *b, char c)  { sb_add(b, &c, 1); }
 
 static const char *agent_system_prompt(void) {
     return
-    "You are hy3-agent, a coding agent running inside a local inference engine. "
+    "You are a function-calling coding assistant running in a local workspace. "
     "Use tools for local file and system work. Avoid printing large file contents "
     "as answers; create or edit files with tools, then summarise briefly.\n\n"
-    "## Tools\n"
-    "Emit exactly ONE tool call per message:\n\n"
-    "<tool_call>{\"name\":\"<tool>\",\"arguments\":{<params>}}</tool_call>\n\n"
-    "Finish thinking before emitting a tool call. When you are done with all tool "
-    "work, write your final answer with NO <tool_call> block.\n\n"
-    "### Editing files\n"
-    "Use write for new files or full replacement. Use edit with path, old, and new "
-    "for targeted changes. The old text must match exactly once in the current file; "
-    "otherwise edit fails for safety.\n"
-    "For large replacements, prefer anchored old: write the first lines, then [upto], "
-    "then the final lines. The tool replaces everything from the head through the tail. "
-    "If the head or tail is ambiguous, the edit fails.\n"
-    "Example: old=\"line1\\nline2\\n[upto]\\nlast line\n\"\n\n"
-    "### Available tool schemas\n\n"
-    "bash  — Run a shell command.\n"
-    "  {\"command\":\"...\",\"timeout\":<seconds>}\n\n"
-    "read  — Read a text file or a range of lines.\n"
-    "  {\"path\":\"...\",\"offset\":<start_line>,\"limit\":<lines>}\n\n"
-    "more  — Continue the previous read.\n"
-    "  {\"lines\":<count>}\n\n"
-    "write — Create or overwrite a text file.\n"
-    "  {\"path\":\"...\",\"content\":\"...\"}\n\n"
-    "edit  — Replace exactly one old text match in a file.\n"
-    "  {\"path\":\"...\",\"old\":\"...\",\"new\":\"...\"}\n\n"
-    "grep  — Search with a regex pattern.\n"
-    "  {\"pattern\":\"...\",\"path\":\"...\",\"include\":\"*.c\"}\n\n"
-    "list  — List a directory.\n"
-    "  {\"path\":\"...\"}\n\n"
-    "# Rules\n"
+    "You can call the following tools (described as JSON schemas):\n\n"
+    "[\n"
+    "  {\n"
+    "    \"name\": \"bash\",\n"
+    "    \"description\": \"Run a shell command.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"command\": {\"type\": \"string\"},\n"
+    "        \"timeout\": {\"type\": \"number\"}\n"
+    "      },\n"
+    "      \"required\": [\"command\"]\n"
+    "    }\n"
+    "  },\n"
+    "  {\n"
+    "    \"name\": \"read\",\n"
+    "    \"description\": \"Read a text file or a range of lines.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"path\": {\"type\": \"string\"},\n"
+    "        \"offset\": {\"type\": \"number\"},\n"
+    "        \"limit\": {\"type\": \"number\"}\n"
+    "      },\n"
+    "      \"required\": [\"path\"]\n"
+    "    }\n"
+    "  },\n"
+    "  {\n"
+    "    \"name\": \"more\",\n"
+    "    \"description\": \"Continue the previous read for more lines.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"lines\": {\"type\": \"number\"}\n"
+    "      }\n"
+    "    }\n"
+    "  },\n"
+    "  {\n"
+    "    \"name\": \"write\",\n"
+    "    \"description\": \"Create or overwrite a text file.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"path\": {\"type\": \"string\"},\n"
+    "        \"content\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"path\", \"content\"]\n"
+    "    }\n"
+    "  },\n"
+    "  {\n"
+    "    \"name\": \"edit\",\n"
+    "    \"description\": \"Replace old text with new in a file. old must match exactly once.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"path\": {\"type\": \"string\"},\n"
+    "        \"old\": {\"type\": \"string\"},\n"
+    "        \"new\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"path\", \"old\", \"new\"]\n"
+    "    }\n"
+    "  },\n"
+    "  {\n"
+    "    \"name\": \"grep\",\n"
+    "    \"description\": \"Search with a regex pattern.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"pattern\": {\"type\": \"string\"},\n"
+    "        \"path\": {\"type\": \"string\"},\n"
+    "        \"include\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"pattern\"]\n"
+    "    }\n"
+    "  },\n"
+    "  {\n"
+    "    \"name\": \"list\",\n"
+    "    \"description\": \"List a directory.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"path\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"path\"]\n"
+    "    }\n"
+    "  }\n"
+    "]\n\n"
+    "Instructions:\n"
     "- Explore before editing: list, grep, then read.\n"
     "- One logical change at a time. Do not re-read files after editing.\n"
-    "- If a tool fails, diagnose the error before retrying.\n"
-    "- Run tests / lint after making changes.\n"
-    "- Keep answers terse.";
+    "- If the user's request should be handled by one of the tools, respond "
+    "with EXACTLY one tool call and nothing else, in this format:\n"
+    "  <tool_call>{\"name\": \"<tool_name>\", \"arguments\": {<args>}}</tool_call>\n"
+    "- The arguments must be valid JSON and match the tool's schema.\n"
+    "- If none of the tools are appropriate, respond with:\n"
+    "  <tool_call>none</tool_call>\n"
+    "  followed by a brief direct answer.\n"
+    "- After receiving a tool result, either call another tool or give your final answer.\n"
+    "- When you are done with all tool work, give your final answer with no <tool_call> tag.";
 }
 
 /* ============================================================================
@@ -273,20 +338,24 @@ static void tool_list(strbuf *r, const char *path) {
  * Tool call parser  (in-flight, scans buffer for <tool_call>...</tool_call>)
  * ============================================================================ */
 
-typedef struct { char name[64]; char args_buf[16384]; int args_len; } tool_call;
+typedef struct { char name[64]; char args_buf[16384]; int args_len; int is_none; } tool_call;
 
-/* Returns pointer past </tool_call> if a complete call found, NULL otherwise */
+/* Returns pointer past </tool_call> if a complete call found, NULL otherwise.
+ * tc->is_none = 1 if the model chose not to call a tool. */
 static const char *parse_tool_call(const char *text, tool_call *tc) {
     const char *tag = "<tool_call>", *endt = "</tool_call>";
     const char *s = strstr(text, tag);
     if (!s) return NULL;
     s += strlen(tag);
     const char *e = strstr(s, endt);
-    if (!e) return NULL; /* incomplete */
+    if (!e) return NULL;
+    memset(tc, 0, sizeof(*tc));
+    /* check for "none" */
+    { const char *p = s; while (*p == ' ') p++;
+      if (strncmp(p, "none", 4) == 0) { tc->is_none = 1; return e + strlen(endt); } }
     size_t jl = (size_t)(e - s);
     char *js = malloc(jl + 1); if (!js) return NULL;
-    memcpy(js, s, jl); js[jl] = '\0'; memset(tc, 0, sizeof(*tc));
-
+    memcpy(js, s, jl); js[jl] = '\0';
     const char *nv = json_find_key(js, "name");
     if (nv) { nv = json_skip_ws(nv); strbuf n = {0}; sb_init(&n, 64);
         if (*nv == '"') { nv = json_get_string(nv, &n); strncpy(tc->name, n.buf, sizeof(tc->name)-1); }
@@ -443,24 +512,12 @@ static void agent_run(agent_session *s, const char *user_msg) {
         tool_call tc;
         parse_tool_call(raw, &tc);
 
-        if (!tc.name[0]) {
-            /* Final answer */
-            /* Remove <tool_call> prefix noise if any */
-            const char *tag = strstr(raw, "<tool_call>");
-            if (tag) {
-                const char *end = strstr(tag, "</tool_call>");
-                if (end) { const char *rest = end + strlen("</tool_call>");
-                    if (*rest) { sb_puts(&conv, rest); sb_puts(&conv, "\n"); } }
-            } else {
-                sb_puts(&conv, raw); sb_puts(&conv, "\n");
-            }
+        if (tc.is_none || !tc.name[0]) {
             break;
         }
 
         /* Tool call detected — execute it */
         char *result = dispatch_tool(s, &tc);
-
-        /* Print tool output */
         printf("[tool: %s]\n%.450s%s\n\n", tc.name, result,
                strlen(result) > 450 ? "..." : "");
 
