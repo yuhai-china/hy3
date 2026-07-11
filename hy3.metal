@@ -25,7 +25,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-constant float HY3_ROPE_THETA_C = 11158840.0f;
 constant float HY3_RMS_EPS_C = 1e-5f;
 
 // ---------------------------------------------------------------------
@@ -101,6 +100,54 @@ kernel void rms_norm_heads(device float       *buf [[buffer(0)]],
     float r = rsqrt(sdata[0] / float(head_dim) + HY3_RMS_EPS_C);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < head_dim; i += tgSz) x[i] = x[i] * r * w[i];
+}
+
+// Fused per-head Q/K RMSNorm + RoPE (rotate_half pairing). One threadgroup
+// per head (Q heads then K heads). Replaces two rms_norm_heads dispatches
+// plus the separate rope dispatch (3 -> 1) and drops the barrier between norm
+// and rope. inv_freq[d] = 1/pow(theta, 2d/head_dim), precomputed on the host.
+kernel void rms_norm_heads_rope(device float       *q   [[buffer(0)]],
+                                device float       *k   [[buffer(1)]],
+                                device const float *qw  [[buffer(2)]],
+                                device const float *kw  [[buffer(3)]],
+                                constant uint      &head_dim   [[buffer(4)]],
+                                constant uint      &n_heads   [[buffer(5)]],
+                                constant uint      &n_kv_heads [[buffer(6)]],
+                                constant int       &pos       [[buffer(7)]],
+                                device const float *inv_freq  [[buffer(8)]],
+                                uint head [[threadgroup_position_in_grid]],
+                                uint tid  [[thread_index_in_threadgroup]],
+                                uint tgSz [[threads_per_threadgroup]])
+{
+    threadgroup float sdata[256];
+    bool is_kv = (head >= n_heads);
+    uint hh = is_kv ? (head - n_heads) : head;
+    device float *buf = is_kv ? k : q;
+    device const float *w = is_kv ? kw : qw;
+    device float *x = buf + (size_t)hh * head_dim;
+    float sum = 0.0f;
+    for (uint i = tid; i < head_dim; i += tgSz) sum += x[i] * x[i];
+    sdata[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgSz / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float r = rsqrt(sdata[0] / float(head_dim) + HY3_RMS_EPS_C);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < head_dim; i += tgSz) x[i] = x[i] * r * w[i];
+    // Barrier: rope reads x[d+half_dim] written by another thread's norm
+    // above, so the norm writes must be visible before the rope reads.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // RoPE rotate_half: pair d with d+half_dim within this head.
+    uint half_dim = head_dim / 2;
+    for (uint d = tid; d < half_dim; d += tgSz) {
+        float freq = float(pos) * inv_freq[d];
+        float c = cos(freq), s = sin(freq);
+        float v0 = x[d], v1 = x[d + half_dim];
+        x[d]            = v0 * c - v1 * s;
+        x[d + half_dim] = v1 * c + v0 * s;
+    }
 }
 
 /* All of the small elementwise kernels below take an explicit element
@@ -197,12 +244,13 @@ kernel void embed_lookup_f32(device float *out [[buffer(0)]],
 // Dispatched with (n_heads+n_kv_heads)*(head_dim/2) threads.
 // ---------------------------------------------------------------------
 kernel void rope(device float *q [[buffer(0)]],
-                  device float *k [[buffer(1)]],
-                  constant int  &pos [[buffer(2)]],
-                  constant uint &head_dim [[buffer(3)]],
-                  constant uint &n_heads [[buffer(4)]],
-                  constant uint &n_kv_heads [[buffer(5)]],
-                  uint idx [[thread_position_in_grid]])
+                   device float *k [[buffer(1)]],
+                   constant int  &pos [[buffer(2)]],
+                   constant uint &head_dim [[buffer(3)]],
+                   constant uint &n_heads [[buffer(4)]],
+                   constant uint &n_kv_heads [[buffer(5)]],
+                   device const float *inv_freq [[buffer(6)]],
+                   uint idx [[thread_position_in_grid]])
 {
     uint half_dim = head_dim / 2;
     uint total = (n_heads + n_kv_heads) * half_dim;
@@ -216,7 +264,9 @@ kernel void rope(device float *q [[buffer(0)]],
     }
     device float *buf = is_kv ? k : q;
     device float *base = buf + (size_t)h * head_dim;
-    float freq = float(pos) / pow(HY3_ROPE_THETA_C, float(2 * d) / float(head_dim));
+    // inv_freq[d] = 1/pow(theta, 2d/head_dim) precomputed on the host, so a
+    // multiply replaces a per-element pow()/exp() in this hot kernel.
+    float freq = float(pos) * inv_freq[d];
     float c = cos(freq), s = sin(freq);
     float v0 = base[d], v1 = base[d + half_dim];
     base[d]            = v0 * c - v1 * s;
@@ -280,7 +330,12 @@ kernel void attention(device float       *out      [[buffer(0)]],
     device const float *q_h = q + (size_t)h * head_dim;
     float scale = rsqrt(float(head_dim));
 
-    int ntok = (kv_len - layer_id + n_layers - 1) / n_layers;
+    /* Number of tokens whose K/V are present for this layer: cache_len is in
+     * units of (token*80 + layer), so the current token T contributes slots
+     * 0..T (inclusive of its own K/V, written just above). That count is
+     * (kv_len - layer_id)/n_layers + 1 = (kv_len - layer_id + n_layers)/n_layers.
+     * The previous "- 1" excluded the current token's self-attention. */
+    int ntok = (kv_len - layer_id + n_layers) / n_layers;
     if (ntok < 1) ntok = 1;
 
     /* q value this thread contributes to every dot product (thread d owns dim d). */
@@ -319,6 +374,122 @@ kernel void attention(device float       *out      [[buffer(0)]],
         device float *out_h = out + (size_t)h * head_dim;
         out_h[tid] = acc / (l + 1e-10f);
     }
+}
+
+// ---------------------------------------------------------------------
+// Split-KV attention (FlashDecoding). Partition the KV sequence
+// across ATTN_SPLITS chunks; each chunk runs online-softmax independently
+// and writes (m, l, acc[0..head_dim-1]) partials. A second reduce kernel
+// merges partials via online-softmax. This cuts the per-head serial scan
+// ~16x, removing the O(context) decode bottleneck.
+// ---------------------------------------------------------------------
+
+kernel void attention_split(
+    device float       *partials   [[buffer(0)]],
+    device const float *q          [[buffer(1)]],
+    device const half  *k_cache    [[buffer(2)]],
+    device const half  *v_cache    [[buffer(3)]],
+    constant uint      &n_heads    [[buffer(4)]],
+    constant uint      &n_kv_heads [[buffer(5)]],
+    constant uint      &head_dim   [[buffer(6)]],
+    constant int       &kv_len     [[buffer(7)]],
+    constant uint      &kv_group   [[buffer(8)]],
+    constant int       &layer_id   [[buffer(9)]],
+    constant int       &n_layers   [[buffer(10)]],
+    constant uint      &n_splits   [[buffer(11)]],
+    threadgroup float  *red        [[threadgroup(0)]],
+    uint gid   [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]],
+    uint tgSz  [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_grp  [[simdgroup_index_in_threadgroup]])
+{
+    uint h     = gid / n_splits;
+    uint split = gid % n_splits;
+    if (h >= n_heads) return;
+
+    uint kv_h = h / kv_group;
+    int ntok  = (kv_len - layer_id + n_layers) / n_layers;
+    if (ntok < 1) ntok = 1;
+
+    int chunk  = (ntok + (int)n_splits - 1) / (int)n_splits;
+    int r0     = (int)split * chunk;
+    int r1     = r0 + chunk;
+    if (r1 > ntok) r1 = ntok;
+
+    device float *p = partials + (size_t)gid * (2 + head_dim);
+
+    if (r0 >= r1) {
+        if (tid == 0) { p[0] = -INFINITY; p[1] = 0.0f; }
+        for (uint i = tid; i < head_dim; i += tgSz) p[2 + i] = 0.0f;
+        return;
+    }
+
+    device const float *q_h = q + (size_t)h * head_dim;
+    float qd = (tid < head_dim) ? q_h[tid] : 0.0f;
+    float scale = rsqrt(float(head_dim));
+    const uint n_simd = tgSz / 32;
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc = 0.0f;
+
+    for (int t = r0; t < r1; t++) {
+        size_t base = (size_t)(t * n_layers + layer_id) * n_kv_heads * head_dim
+                    + (size_t)kv_h * head_dim;
+
+        float part = (tid < head_dim) ? qd * (float)k_cache[base + tid] : 0.0f;
+        part = simd_sum(part);
+        if (simd_lane == 0) red[simd_grp] = part;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float s = 0.0f;
+        for (uint i = 0; i < n_simd; i++) s += red[i];
+        s *= scale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float m_new = max(m, s);
+        float corr = exp(m - m_new);
+        float prob = exp(s - m_new);
+        l   = l   * corr + prob;
+        acc = acc * corr + prob * ((tid < head_dim) ? (float)v_cache[base + tid] : 0.0f);
+        m   = m_new;
+    }
+
+    if (tid == 0) { p[0] = m; p[1] = l; }
+    p[2 + tid] = (tid < head_dim) ? acc : 0.0f;
+}
+
+kernel void attention_reduce(
+    device float       *out       [[buffer(0)]],
+    device const float *partials  [[buffer(1)]],
+    constant uint      &n_heads   [[buffer(2)]],
+    constant uint      &head_dim  [[buffer(3)]],
+    constant uint      &n_splits  [[buffer(4)]],
+    uint h   [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    if (h >= n_heads || tid >= head_dim) return;
+
+    float m_global = -INFINITY;
+    float l_global = 0.0f;
+    float acc = 0.0f;
+
+    for (uint s = 0; s < n_splits; s++) {
+        size_t off = (size_t)(h * n_splits + s) * (2 + head_dim);
+        float pm = partials[off];
+        float pl = partials[off + 1];
+        if (pl <= 0.0f) continue;
+
+        float m_new = max(m_global, pm);
+        float corr  = exp(m_global - m_new);
+        float rsc   = exp(pm - m_new);
+        l_global = l_global * corr + pl * rsc;
+        acc      = acc      * corr + partials[off + 2 + tid] * rsc;
+        m_global = m_new;
+    }
+
+    float inv = (l_global > 0.0f) ? (1.0f / l_global) : 0.0f;
+    out[(size_t)h * head_dim + tid] = acc * inv;
 }
 
 // ---------------------------------------------------------------------

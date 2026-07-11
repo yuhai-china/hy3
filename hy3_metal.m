@@ -48,6 +48,7 @@ extern "C" {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -75,6 +76,7 @@ typedef struct {
     id<MTLComputePipelineState> pipe_rms_norm;
     id<MTLComputePipelineState> pipe_rms_norm_offset;
     id<MTLComputePipelineState> pipe_rms_norm_heads;
+    id<MTLComputePipelineState> pipe_rms_norm_heads_rope;
     id<MTLComputePipelineState> pipe_silu_mul;
     id<MTLComputePipelineState> pipe_sigmoid;
     id<MTLComputePipelineState> pipe_add;
@@ -84,6 +86,8 @@ typedef struct {
     id<MTLComputePipelineState> pipe_embed_f32;
     id<MTLComputePipelineState> pipe_rope;
     id<MTLComputePipelineState> pipe_attention;
+    id<MTLComputePipelineState> pipe_attention_split;
+    id<MTLComputePipelineState> pipe_attention_reduce;
     id<MTLComputePipelineState> pipe_matmul_f32;
     id<MTLComputePipelineState> pipe_matmul_f16;
     id<MTLComputePipelineState> pipe_matmul_q8_0;
@@ -114,6 +118,7 @@ typedef struct {
     id<MTLBuffer> d_k;           /* HY3_N_KV_HEAD*HY3_HEAD_DIM */
     id<MTLBuffer> d_v;           /* HY3_N_KV_HEAD*HY3_HEAD_DIM */
     id<MTLBuffer> d_attn_out;    /* HY3_N_HEAD*HY3_HEAD_DIM */
+    id<MTLBuffer> d_attn_partials; /* n_heads * ATTN_SPLITS * (2 + head_dim) floats */
     id<MTLBuffer> d_o_proj;      /* HY3_N_EMBD */
     id<MTLBuffer> d_gate;        /* max(HY3_DENSE_INTERMED, HY3_MOE_INTERMED) */
     id<MTLBuffer> d_up;          /* max(HY3_DENSE_INTERMED, HY3_MOE_INTERMED) */
@@ -126,6 +131,7 @@ typedef struct {
     /* Fast MoE path (ds4-style, GPU-resident routing). */
     id<MTLBuffer> d_router_ids;  /* HY3_N_EXPERT_USED int32 expert ids */
     id<MTLBuffer> d_router_wts;  /* HY3_N_EXPERT_USED float combine weights */
+    id<MTLBuffer> d_rope_inv_freq; /* HY3_HEAD_DIM/2 precomputed 1/theta^(2d/dim) */
     id<MTLBuffer> d_bias;        /* HY3_N_LAYER * HY3_N_EXPERT float expert bias (all layers, uploaded once) */
     id<MTLBuffer> d_gate_k;      /* HY3_N_EXPERT_USED * HY3_MOE_INTERMED */
     id<MTLBuffer> d_up_k;        /* HY3_N_EXPERT_USED * HY3_MOE_INTERMED */
@@ -138,6 +144,8 @@ typedef struct {
     int concurrent;    /* 1 = concurrent encoder; helpers skip auto barriers and
                         * the caller inserts explicit barriers at dependency edges */
 } hy3_metal_ctx_t;
+
+#define METAL_ATTN_SPLITS 16
 
 /* =========================================================================
  * Zero-copy model wrapping
@@ -245,9 +253,15 @@ static bool hy3_metal_wrap_model(hy3_metal_ctx_t *ctx, hy3_model *m) {
         uint64_t view_bytes = mapped_size - off;
         if (view_bytes > max_buffer) view_bytes = max_buffer;
 
+        /* Zero-copy: wrap the file mmap directly as a Metal buffer. The GGUF
+         * mmap is prefaulted (read-touched) in hy3_model_load so every page is
+         * resident, and iogpu.wired_limit_mb is raised to ~180 GiB so the GPU
+         * can wire those pages (otherwise the GPU reads ZERO instead of
+         * faulting the page in, silencing the model). Skip the prefault with
+         * HY3_NO_PREFAULT only if the pages are guaranteed resident. */
         id<MTLBuffer> buf = [ctx->device newBufferWithBytesNoCopy:(void *)(model_addr + off)
-                                                            length:(NSUInteger)view_bytes
-                                                           options:MTLResourceStorageModeShared
+                                                              length:(NSUInteger)view_bytes
+                                                             options:MTLResourceStorageModeShared
                                                        deallocator:nil];
         if (!buf) {
             fprintf(stderr, "hy3_metal: failed to wrap model view at offset %.2f GiB, size %.2f GiB\n",
@@ -435,6 +449,29 @@ static void m_rms_norm_heads(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> 
     if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
+/* Fused per-head Q/K RMSNorm + RoPE in a single dispatch (grid = n_heads +
+ * n_kv_heads threadgroups). Avoids the separate rms_norm_heads x2 + rope
+ * sequence and the barrier between norm and rope. */
+static void m_rms_norm_heads_rope(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
+                                  id<MTLBuffer> q, id<MTLBuffer> k,
+                                  const hy3_weight *qw, const hy3_weight *kw,
+                                  uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads,
+                                  int pos) {
+    [enc setComputePipelineState:ctx->pipe_rms_norm_heads_rope];
+    [enc setBuffer:q offset:0 atIndex:0];
+    [enc setBuffer:k offset:0 atIndex:1];
+    if (!hy3_bind_weight(enc, ctx, qw, 2)) exit(1);
+    if (!hy3_bind_weight(enc, ctx, kw, 3)) exit(1);
+    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:4];
+    [enc setBytes:&n_heads length:sizeof(n_heads) atIndex:5];
+    [enc setBytes:&n_kv_heads length:sizeof(n_kv_heads) atIndex:6];
+    [enc setBytes:&pos length:sizeof(pos) atIndex:7];
+    [enc setBuffer:ctx->d_rope_inv_freq offset:0 atIndex:8];
+    uint32_t grid = n_heads + n_kv_heads;
+    [enc dispatchThreadgroups:MTLSizeMake(grid, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
 static void m_mul_mat(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
                        const hy3_weight *w, id<MTLBuffer> dst, id<MTLBuffer> x,
                        uint32_t m_rows, uint32_t n_cols) {
@@ -550,6 +587,7 @@ static void m_rope(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
     [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:3];
     [enc setBytes:&n_heads length:sizeof(n_heads) atIndex:4];
     [enc setBytes:&n_kv_heads length:sizeof(n_kv_heads) atIndex:5];
+    [enc setBuffer:ctx->d_rope_inv_freq offset:0 atIndex:6];
     uint32_t total = (n_heads + n_kv_heads) * (head_dim / 2);
     NSUInteger tg = 256;
     [enc dispatchThreadgroups:MTLSizeMake((total + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
@@ -575,8 +613,11 @@ static void m_attention(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
                          id<MTLBuffer> out, id<MTLBuffer> q,
                          uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
                          int kv_len, uint32_t kv_group, int layer_id, int n_layers) {
-    [enc setComputePipelineState:ctx->pipe_attention];
-    [enc setBuffer:out offset:0 atIndex:0];
+    uint32_t n_splits = METAL_ATTN_SPLITS;
+
+    /* --- Split pass: n_heads * n_splits threadgroups, head_dim threads each --- */
+    [enc setComputePipelineState:ctx->pipe_attention_split];
+    [enc setBuffer:ctx->d_attn_partials offset:0 atIndex:0];
     [enc setBuffer:q offset:0 atIndex:1];
     [enc setBuffer:ctx->d_k_cache offset:0 atIndex:2];
     [enc setBuffer:ctx->d_v_cache offset:0 atIndex:3];
@@ -587,8 +628,19 @@ static void m_attention(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
     [enc setBytes:&kv_group length:sizeof(kv_group) atIndex:8];
     [enc setBytes:&layer_id length:sizeof(layer_id) atIndex:9];
     [enc setBytes:&n_layers length:sizeof(n_layers) atIndex:10];
+    [enc setBytes:&n_splits length:sizeof(n_splits) atIndex:11];
     [enc setThreadgroupMemoryLength:64 * sizeof(float) atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc dispatchThreadgroups:MTLSizeMake(n_heads * n_splits, 1, 1) threadsPerThreadgroup:MTLSizeMake(head_dim, 1, 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];  /* split → reduce dependency */
+
+    /* --- Reduce pass: n_heads threadgroups, head_dim threads each --- */
+    [enc setComputePipelineState:ctx->pipe_attention_reduce];
+    [enc setBuffer:out offset:0 atIndex:0];
+    [enc setBuffer:ctx->d_attn_partials offset:0 atIndex:1];
+    [enc setBytes:&n_heads length:sizeof(n_heads) atIndex:2];
+    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:3];
+    [enc setBytes:&n_splits length:sizeof(n_splits) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(head_dim, 1, 1)];
     if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
@@ -643,6 +695,7 @@ int hy3_metal_init(hy3_model *m) {
     ctx->pipe_rms_norm        = hy3_make_pipeline(ctx->device, ctx->library, "rms_norm");
     ctx->pipe_rms_norm_offset = hy3_make_pipeline(ctx->device, ctx->library, "rms_norm_offset");
     ctx->pipe_rms_norm_heads  = hy3_make_pipeline(ctx->device, ctx->library, "rms_norm_heads");
+    ctx->pipe_rms_norm_heads_rope = hy3_make_pipeline(ctx->device, ctx->library, "rms_norm_heads_rope");
     ctx->pipe_silu_mul        = hy3_make_pipeline(ctx->device, ctx->library, "silu_mul");
     ctx->pipe_sigmoid         = hy3_make_pipeline(ctx->device, ctx->library, "sigmoid_inplace");
     ctx->pipe_add             = hy3_make_pipeline(ctx->device, ctx->library, "add_inplace");
@@ -652,6 +705,8 @@ int hy3_metal_init(hy3_model *m) {
     ctx->pipe_embed_f32       = hy3_make_pipeline(ctx->device, ctx->library, "embed_lookup_f32");
     ctx->pipe_rope            = hy3_make_pipeline(ctx->device, ctx->library, "rope");
     ctx->pipe_attention       = hy3_make_pipeline(ctx->device, ctx->library, "attention");
+    ctx->pipe_attention_split = hy3_make_pipeline(ctx->device, ctx->library, "attention_split");
+    ctx->pipe_attention_reduce= hy3_make_pipeline(ctx->device, ctx->library, "attention_reduce");
     ctx->pipe_matmul_f32      = hy3_make_pipeline(ctx->device, ctx->library, "matmul_f32");
     ctx->pipe_matmul_f16      = hy3_make_pipeline(ctx->device, ctx->library, "matmul_f16");
     ctx->pipe_matmul_q8_0     = hy3_make_pipeline(ctx->device, ctx->library, "matmul_q8_0");
@@ -679,6 +734,10 @@ int hy3_metal_init(hy3_model *m) {
     ctx->d_k          = hy3_alloc(ctx->device, HY3_N_KV_HEAD * HY3_HEAD_DIM);
     ctx->d_v          = hy3_alloc(ctx->device, HY3_N_KV_HEAD * HY3_HEAD_DIM);
     ctx->d_attn_out   = hy3_alloc(ctx->device, HY3_N_HEAD * HY3_HEAD_DIM);
+    {
+        uint32_t n = HY3_N_HEAD * METAL_ATTN_SPLITS * (uint32_t)(2 + HY3_HEAD_DIM);
+        ctx->d_attn_partials = hy3_alloc(ctx->device, n);
+    }
     ctx->d_o_proj     = hy3_alloc(ctx->device, HY3_N_EMBD);
     ctx->d_gate       = hy3_alloc(ctx->device, inter);
     ctx->d_up         = hy3_alloc(ctx->device, inter);
@@ -696,6 +755,19 @@ int hy3_metal_init(hy3_model *m) {
     ctx->d_up_k       = hy3_alloc(ctx->device, (uint64_t)HY3_N_EXPERT_USED * HY3_MOE_INTERMED);
     ctx->d_mid_k      = hy3_alloc(ctx->device, (uint64_t)HY3_N_EXPERT_USED * HY3_MOE_INTERMED);
     ctx->d_down_k     = hy3_alloc(ctx->device, (uint64_t)HY3_N_EXPERT_USED * HY3_N_EMBD);
+
+    /* Precompute RoPE inv_freq[d] = 1/theta^(2d/head_dim) once on the host. */
+    {
+        uint32_t half_dim = HY3_HEAD_DIM / 2;
+        float *inv = (float *)calloc(half_dim, sizeof(float));
+        const double theta = 11158840.0;
+        for (uint32_t d = 0; d < half_dim; d++)
+            inv[d] = (float)(1.0 / pow(theta, 2.0 * d / (double)HY3_HEAD_DIM));
+        ctx->d_rope_inv_freq = [ctx->device newBufferWithBytes:inv
+                                                        length:half_dim * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+        free(inv);
+    }
 
     /* Upload every layer's expert bias once (static). Layers without a bias
      * tensor get zeros. The fast MoE router reads bias at offset il*NE. */
@@ -946,12 +1018,17 @@ static void metal_encode_attention(hy3_metal_ctx_t *ctx, hy3_model *m, int il, i
     m_mul_mat(ctx, enc, &l->attn_k, ctx->d_k, ctx->d_s, kv_size, HY3_N_EMBD);
     m_mul_mat(ctx, enc, &l->attn_v, ctx->d_v, ctx->d_s, kv_size, HY3_N_EMBD);
     BAR();  /* q,k,v ready before norm/rope */
-    if (l->attn_q_norm.data)
-        m_rms_norm_heads(ctx, enc, ctx->d_q, &l->attn_q_norm, HY3_HEAD_DIM, HY3_N_HEAD);
-    if (l->attn_k_norm.data)
-        m_rms_norm_heads(ctx, enc, ctx->d_k, &l->attn_k_norm, HY3_HEAD_DIM, HY3_N_KV_HEAD);
-    BAR();  /* q/k norm before rope */
-    m_rope(ctx, enc, ctx->d_q, ctx->d_k, pos, HY3_HEAD_DIM, HY3_N_HEAD, HY3_N_KV_HEAD);
+    if (l->attn_q_norm.data && l->attn_k_norm.data)
+        m_rms_norm_heads_rope(ctx, enc, ctx->d_q, ctx->d_k, &l->attn_q_norm, &l->attn_k_norm,
+                              HY3_HEAD_DIM, HY3_N_HEAD, HY3_N_KV_HEAD, pos);
+    else {
+        if (l->attn_q_norm.data)
+            m_rms_norm_heads(ctx, enc, ctx->d_q, &l->attn_q_norm, HY3_HEAD_DIM, HY3_N_HEAD);
+        if (l->attn_k_norm.data)
+            m_rms_norm_heads(ctx, enc, ctx->d_k, &l->attn_k_norm, HY3_HEAD_DIM, HY3_N_KV_HEAD);
+        BAR();  /* q/k norm before rope */
+        m_rope(ctx, enc, ctx->d_q, ctx->d_k, pos, HY3_HEAD_DIM, HY3_N_HEAD, HY3_N_KV_HEAD);
+    }
     BAR();  /* rope before kv write + attention read q */
     m_kv_cache_write(ctx, enc, kv_len, kv_size);
     m->cache_len = kv_len + 1;
