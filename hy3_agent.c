@@ -383,14 +383,22 @@ static double tc_num(const tool_call *tc, const char *k, double def) {
 }
 
 /* ============================================================================
- * Agent session  (model handle + read state for 'more')
+ * Agent session + chat template
  * ============================================================================ */
+
+/* Hy3 Hunyuan V3 chat template.
+ * These strings, when tokenized by hy3_tokenize, resolve to the actual
+ * control tokens because the tokenizer maps the raw text to special tokens. */
+#define CHAT_BOS  "<｜hy_begin_of_sentence:opensource｜>"
+#define CHAT_MODE "<｜reasoning_mode:opensource｜>reasoning_effort:no_think"
+#define CHAT_USER "<｜hy_User:opensource｜>"
+#define CHAT_ASST "<｜hy_Assistant:opensource｜>"
+#define CHAT_THINK "<think:opensource></think:opensource>"
 
 typedef struct {
     hy3_model *model;
     float     *logits;
     int        pos;
-    /* read state for 'more' tool */
     char      *last_read_path;
     int        last_read_off;
 } agent_session;
@@ -405,23 +413,22 @@ static void sess_free(agent_session *s) { free(s->logits); free(s->last_read_pat
  * Streaming generation with in-flight tool-call detection
  * ============================================================================ */
 
-/* Evaluate a chat-formatted prompt, streaming tokens. Returns the complete
- * assistant text (heap-allocated). If a full <tool_call>...</tool_call> is
- * detected mid-stream, stops early and returns the text. */
-static char *sess_generate(agent_session *s, const char *chat_text,
-                            float temp, int max_tok) {
+/* Prefill tokens and then generate. Returns heap-allocated text.
+ * If greedy_init is set, prefill the provided text from scratch. Otherwise
+ * prefill only new continuation tokens then generate. */
+static char *sess_chat(agent_session *s, const char *text, float temp,
+                        int max_tok) {
     hy3_model *m = s->model;
     hy3_tokens input = {0};
-    hy3_tokenize(m, chat_text, &input);
+    hy3_tokenize(m, text, &input);
     if (!input.len) { free(input.v); return strdup(""); }
 
-    /* prefill */
+    /* prefill all tokens (the caller must ensure no double-processing) */
     { hy3_tokens one = {.len=1,.v=&input.v[0]}; hy3_eval(m, &one, s->logits, &s->pos); }
     for (int i = 1; i < input.len; i++)
         { hy3_tokens one = {.len=1,.v=&input.v[i]}; hy3_eval(m, &one, s->logits, &s->pos); }
     free(input.v);
 
-    /* generate */
     strbuf out; sb_init(&out, 4096);
     int eos = hy3_token_eos(m);
     int tool_detected = 0;
@@ -429,22 +436,17 @@ static char *sess_generate(agent_session *s, const char *chat_text,
     for (int step = 0; step < max_tok; step++) {
         int tok = hy3_sample(m, s->logits, temp, -1, 1.0f);
         if (tok == eos || tok == 120001 || tok == 120008) break;
-
         char piece[128];
         if (hy3_detokenize(m, tok, piece, sizeof(piece)) <= 0) break;
         if (strstr(piece, "<｜hy_User") || strstr(piece, "<｜hy_Assistant")) break;
-
         printf("%s", piece); fflush(stdout);
         sb_puts(&out, piece);
-
-        /* in-flight tool call detection */
+        if (strstr(out.buf, "\nUser:") || strstr(out.buf, "\nAssistant:")) break;
         tool_call tc;
         if (parse_tool_call(out.buf, &tc)) { tool_detected = 1; break; }
-
         hy3_tokens one = {.len=1,.v=&tok};
         hy3_eval(m, &one, s->logits, &s->pos);
     }
-
     if (!tool_detected) printf("\n");
     return out.buf;
 }
@@ -492,44 +494,54 @@ static char *dispatch_tool(agent_session *s, tool_call *tc) {
  * ============================================================================ */
 
 static void agent_run(agent_session *s, const char *user_msg) {
-    /* Reset read state for this request */
     free(s->last_read_path); s->last_read_path = NULL; s->last_read_off = 0;
 
-    /* Build conversation: system prompt + user message + assistant preamble */
-    strbuf conv; sb_init(&conv, 65536);
-    sb_puts(&conv, agent_system_prompt());
-    sb_puts(&conv, "\n---\nUser: ");
-    sb_puts(&conv, user_msg);
-    sb_puts(&conv, "\nAssistant: ");
+    /* First turn: chat template + tools + user message, full prefill */
+    strbuf first; sb_init(&first, 65536);
+    sb_puts(&first, CHAT_BOS CHAT_MODE CHAT_USER);
+    sb_puts(&first, agent_system_prompt());
+    sb_puts(&first, "\n\nUser request: ");
+    sb_puts(&first, user_msg);
+    sb_puts(&first, CHAT_ASST CHAT_THINK);
 
-    for (int turn = 0; turn < AGENT_MAX_TURNS; turn++) {
+    char *raw = sess_chat(s, first.buf, AGENT_TEMP, AGENT_MAX_TOKENS);
+    sb_free(&first);
+
+    /* If first response is not a tool call, we're done */
+    tool_call tc;
+    if (raw) parse_tool_call(raw, &tc);
+
+    if (!raw || !*raw || tc.is_none || !tc.name[0]) {
+        free(raw); return;
+    }
+
+    /* Tool call loop */
+    for (int turn = 1; turn < AGENT_MAX_TURNS; turn++) {
         fprintf(stderr, "\n[agent] turn %d/%d ", turn + 1, AGENT_MAX_TURNS);
         fflush(stderr);
 
-        char *raw = sess_generate(s, conv.buf, AGENT_TEMP, AGENT_MAX_TOKENS);
-        if (!raw || !*raw) { free(raw); break; }
-
-        tool_call tc;
-        parse_tool_call(raw, &tc);
-
-        if (tc.is_none || !tc.name[0]) {
-            break;
-        }
-
-        /* Tool call detected — execute it */
         char *result = dispatch_tool(s, &tc);
-        printf("[tool: %s]\n%.450s%s\n\n", tc.name, result,
-               strlen(result) > 450 ? "..." : "");
+        printf("\n[tool: %s]\n%.2000s%s\n", tc.name, result,
+               strlen(result) > 2000 ? "\n... [truncated]" : "");
+        free(raw);
 
-        /* Append tool result to conversation */
-        sb_puts(&conv, "\n<Tool result for "); sb_puts(&conv, tc.name);
-        sb_puts(&conv, ">\n"); sb_puts(&conv, result);
-        sb_puts(&conv, "\n</Tool result>\nAssistant: ");
+        /* Build continuation: tool result + next assistant preamble */
+        strbuf next; sb_init(&next, 16384);
+        sb_puts(&next, "Tool result for "); sb_puts(&next, tc.name);
+        sb_puts(&next, ":\n"); sb_puts(&next, result);
+        sb_puts(&next, "\n" CHAT_ASST CHAT_THINK);
+        free(result);
 
-        free(raw); free(result);
+        raw = sess_chat(s, next.buf, AGENT_TEMP, AGENT_MAX_TOKENS);
+        sb_free(&next);
+
+        if (!raw || !*raw) break;
+        parse_tool_call(raw, &tc);
+        if (tc.is_none || !tc.name[0]) { free(raw); break; }
     }
 
-    sb_free(&conv);
+    free(raw);
+    printf("\n");
 }
 
 /* ============================================================================
