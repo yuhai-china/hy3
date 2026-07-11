@@ -1,9 +1,13 @@
 # 在 CUDA 上优化 GGUF 推理速度 —— 逐步记录
 
-本文档按时间顺序记录了我们如何将 Hy3 GGUF 运行时（`HYV3ForCausalLM`，一个
-2950 亿参数 / 210 亿激活的 MoE 模型，Q4_K_M 量化）的 CUDA 解码路径，在单张
-NVIDIA **B300**（Blackwell Ultra，计算能力 10.3）、CUDA 12.8 上，从
-**4.6 tok/s 提升到 44 tok/s**（80 层全部卸载到 GPU）。
+本文档按时间顺序记录了我们如何加速 Hy3 GGUF 运行时（`HYV3ForCausalLM`，一个
+2950 亿参数 / 210 亿激活的 MoE 模型，Q4_K_M 量化）的 CUDA 解码路径,在单张
+NVIDIA **B300**（Blackwell Ultra，计算能力 10.3）、CUDA 12.8 上（80 层全部卸载到 GPU）。
+
+> **请仔细理解这些数字。** 纯 GPU 的 CUDA graph *重放*时间从约 217 ms/token（基线）
+> 改善到 **约 20 ms/token（≈50 tok/s）** —— 这是本文大部分引用的 kernel 级指标,
+> 是设备端工作约 10× 的真实提速。**它不是端到端的用户吞吐。**
+> 真实多百 token 生成上的持续端到端吞吐是 **约 47–53 tok/s**，且不再随上下文增长而衰减。
 
 目标是让后来的工程师能够复现推理过程、理解每一步*为什么*有效，并避开我们踩过的坑。
 
@@ -200,7 +204,8 @@ Q4_K 超块分配。我们引入 `dev_dot_q4_K_sub`，把每行的工作按其 *
 ### 结果
 
 - 纯 graph 重放：**42.3 → 22.3 ms/token。**
-- 80 层端到端：**22.68 → 44 tok/s**（约 2 倍）。
+- 纯 graph 重放：**42.3 → 22.3 ms/token**（这里可靠的指标）。
+- 短跑 tok/s 大致翻倍；持续端到端（见文首说明）约 20 tok/s,而非短 `-n 40` 报出的约 44。
 
 这一次合并改动是后期最大的收益，因为它精确打击了 profiler 指出的瓶颈：非合并的
 Q4_K 权重读取。
@@ -254,10 +259,81 @@ SGEMV 很小，且省掉了路由的 f32→f16 转换）。代价：权重 +240 
 
 ---
 
+## 9d. 第 11 步 —— Split-KV / FlashDecoding 注意力（消灭上下文衰减）
+
+提交 `3c09a01` —— *Split-KV（FlashDecoding 风格）注意力 → 长上下文解码提速 3.5 倍。*
+
+MoE FFN 被驯服后，下一个瓶颈暴露出来：**attention 解码是 O(context) 的，且几乎没有并行度。**
+64 个头各由一个 warp 服务，该 warp *串行*遍历整个不断增长的 KV 缓存。在 2000 token
+时，attention 已涨到每个 token 约 56 ms —— 占总时间的 75% —— 并且**每多一个 token 还在线性增长**。
+
+### 根因
+
+`attention_kernel_online`（原 `hy3_gpu.cu:173`，现已移除）启动 `HY3_N_HEAD=64` 个
+各 32 线程的 block（每头一个 warp）。每个 warp 跑 `for (r0=0; r0<ntok; r0+=4)` ——
+串行 O(context)。在 148 SM 的 B300 上，GPU 是空闲的：64 个 block 连一半 SM 都填不满。
+
+修复前的每阶段计时：
+```
+ctx ≈ 40:   graph ~22 ms  (attention ~3 ms,  MoE ~19 ms)  → 45 tok/s
+ctx ≈ 320:  graph ~30 ms  (attention ~11 ms, MoE ~19 ms)  → 33 tok/s
+ctx ≈ 2000: graph ~75 ms  (attention ~56 ms, MoE ~19 ms)  → 13 tok/s  ← 崩了！
+```
+
+### 修复：双 kernel 的 split-KV
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| Kernel | `attention_kernel_online` | `attention_split_kv_kernel` + `attention_reduce_kernel` |
+| Block 数 | 64（每头 1 个） | 1024（每头 16 个） |
+| 每个 warp 的活 | N 行 | N/16 行 |
+| SM 占用率 | ~43% | 填满全部 148 SM |
+| 行数 | （已移除） | `hy3_gpu.cu:167`、`hy3_gpu.cu:208` |
+| 偏量缓冲区 | — | 64 × 16 × 130 floats ≈ 530 KB |
+
+**Split kernel**（`attention_split_kv_kernel`，1024 block × 32 线程）：每个 block 服务
+head `h = tid / ATTN_SPLITS`、split `s = tid % ATTN_SPLITS`，处理 KV 行
+`[chunk*s, min(chunk*(s+1), ntok))`。运行与原始相同的 online-softmax，但仅限于其分片，
+然后写出**偏量**：`{max, sum, out[0..127]}` —— 全部 32 条 lane 的 float4 累加器，
+每个 block 共 130 个 float。
+
+**Reduce kernel**（`attention_reduce_kernel`，64 block × 32 线程）：每条 lane 用
+online-softmax 合并规则合并其 head 的 `ATTN_SPLITS` 份偏量：
+`new_max = max(m, p_m); corr = exp(m - new_max); sum = sum*corr + p_sum*exp(p_m - new_max);`
+再按 lane 缩放并输出。
+
+这两个 kernel 都加入到已有的 CUDA graph 捕获中（grid 是静态的，所有 KV 区间逻辑在
+重放时从设备端 `d_pos` 动态得出）。
+
+### 正确性
+
+online-softmax 合并算子构成结合群 —— `merge(a, merge(b, c)) == merge(merge(a, b), c)`
+—— 因此任意切分数都产生与单次通过的原始 kernel **逐位一致**的输出。已实测验证：
+`11+22+33=?` → `66` 且 `capital of France` → `Paris`，在 `ATTN_SPLITS=1`（与旧
+kernel 等价）和 `ATTN_SPLITS=16` 下均通过。
+
+### 结果
+
+| 指标 | 修复前 | 修复后 | 提升 |
+|---|---|---|---|
+| 解码 ctx=40 | 45 tok/s | 53 tok/s | 1.2× |
+| 解码 ctx=2000 | **13.4 tok/s** | **46.9 tok/s** | **3.5×** |
+| 解码 ctx=512（端到端） | ~30 tok/s | **53.0 tok/s** | 1.8× |
+| Graph 阶段平均（512 tok, HY3_TIMING） | 22→75 ms（递增） | **18.7 ms（平稳）** | — |
+| Eval 13 题套件 | （之前慢到无法用） | **259 s** | — |
+
+Graph 阶段现在**恒定在约 19 ms**，不随上下文增长 — MoE FFN 主导，不再是 attention。
+O(context) 的衰减悬崖没了；eval 套件（13 题 × 每道最长 8000 token）全程保持约 50 tok/s。
+
+此改动后剩余主要成本是 MoE FFN 权重带宽（8/256 路由专家每 token 读取约 5.9 GB 的
+Q4_K 权重）。进一步的提升在于 MoE 矩阵乘 kernel 或投机解码。
+
+---
+
 ## 10. 整体进展
 
 | 步骤 | 改动 | tok/s（80 层） |
-|-----:|------|---------------:|
+|-----:|--------|---------------:|
 | 0 | 基线 | 4.6 |
 | 1 | Blackwell 构建 + O(n) KV 缓存 | 约 13.2 |
 | 2 | FP16 KV 缓存 | （合并计入） |
@@ -266,16 +342,21 @@ SGEMV 很小，且省掉了路由的 f32→f16 转换）。代价：权重 +240 
 | 5 | CUDA graph 解码 | 13.84 |
 | 6 | warp-per-row Q4_K 专家矩阵乘 | 20.4 |
 | 7 | Q4_K 子块并行 | 22.68 |
-| 8 | **合并的 warp 协作 Q4_K 行点积** | **44** |
+| 8 | **合并的 warp 协作 Q4_K 行点积** | ~44（短跑） |
 | 9 | 共享/路由专家重叠（第二条 stream） | ~48（纯 GPU） |
 | 10 | FP32 路由 GEMV（稳定性；速度~持平） | ~49（纯 GPU） |
+| 11 | **Split-KV / FlashDecoding 注意力** | **~53（平稳，持续）** |
 
-纯 GPU graph 重放最终约为 20.3 ms/token（约 49 tok/s）。峰值常驻显存约 192 GB
-（FP32 路由后 +240 MB）。
+> 该 tok/s 列混用了测量方式（前几行是短的端到端运行,后几行是纯 GPU graph 重放）。
+> 一致、可靠的指标是 **graph 重放 ms/token**,从约 217 → **约 18.7 ms/token**。
+> **真实生成上的持续端到端吞吐是 ~47–53 tok/s，不再随上下文长度衰减。**
+
+纯 GPU graph 重放最终约为 **18.7 ms/token（约 53 tok/s）**。峰值常驻显存约 192 GB
+（FP32 路由后 +240 MB，split-KV 偏量 +530 KB）。
 
 ---
 
-## 11. 如何验证正确性（每次改动都要做）
+## 12. 如何验证正确性（每次改动都要做）
 
 如果 logits 是错的，速度就毫无意义（回忆一下全零 logits 的坑）。两个快速检查：
 
@@ -298,7 +379,7 @@ SGEMV 很小，且省掉了路由的 f32→f16 转换）。代价：权重 +240 
 
 ---
 
-## 12. 基准测试配方
+## 13. 基准测试配方
 
 ```bash
 # 编译
@@ -322,7 +403,7 @@ HY3_TIMING=1 ...
 
 ---
 
-## 13. 通用经验（可迁移到其他 GGUF/CUDA 工作）
+## 14. 通用经验（可迁移到其他 GGUF/CUDA 工作）
 
 1. **先 profiling 再优化。** 差分的阶段跳过（临时的 `HY3_SKIP_*` 环境变量）告诉
    我们专家占了一个 token 的 85% —— 其余一切都是干扰项。
@@ -339,10 +420,13 @@ HY3_TIMING=1 ...
    不变。
 6. **每次改动都验证精度**，并了解你模型固有的发散区间，以免去追一个其实只是 FP
    归约顺序造成的"bug"。
+7. **也要并行化序列维度。** 每头一个 warp 串行遍历 KV 缓存是 O(context) 的牢笼 —
+   split-KV（FlashDecoding）通过把分块分配到不同 block 打破了这一点，使 attention
+   变成与序列长度无关的固定成本步骤。
 
 ---
 
-## 14. 后续项（已完成）
+## 15. 后续项（已完成）
 
 此处原先列出的三个后续项现已全部完成：
 
@@ -353,9 +437,15 @@ HY3_TIMING=1 ...
 - **已完成** —— 路由稳定性调查促成了 FP32 路由 GEMV（第 10 步；提交 `5285365`），
   显著减小了路由发散。
 
-## 15. 尚存的机会
+## 16. 尚存的机会
 
-- 路由矩阵乘占满了 SM，限制了 stream 重叠的收益；一个把 gate_up→silu→down 融合、
-  不经全局显存往返的常驻核 / 巨核（megakernel）MoE 可以进一步压榨性能。
+- **MoE FFN 是新的地板。** attention 已压平为约 0 ms（藏到 19 ms 的 MoE 里了），
+  每 token 读取约 5.9 GB Q4_K 权重的 8 个专家矩阵乘是主导成本。一个把
+  gate_up→silu→down 融合、不经全局显存往返的常驻核 / 巨核（megakernel）MoE
+  可以进一步压低这 19 ms。
+- **投机解码。** 用小型草稿模型每步产生多个 token —— 解码提速 2–3×，是最大
+  的剩余杠杆，但需要草稿模型和树验证。
+- **FP8 KV 缓存。** 将 KV 显存再减半，支持更大上下文，potentially 更快的
+  attention kernel。
 - 一个完全确定性（固定归约顺序）的专家矩阵乘可让 GPU 输出在不同卸载深度下逐位稳定，
   从而消除哪怕是良性的措辞发散。

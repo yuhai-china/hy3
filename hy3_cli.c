@@ -104,7 +104,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -temp <f>     Temperature (default: 0.9)\n");
     fprintf(stderr, "  -top_k <n>    Top-k sampling (default: 0 = off)\n");
     fprintf(stderr, "  -top_p <f>    Top-p sampling (default: 1.0)\n");
-    fprintf(stderr, "  -experts <n>  MoE experts per token (1..8, default: 8; lower = faster)\n");
+    fprintf(stderr, "  -experts <n>  MoE experts per token (3..8, default: 8 recommended -- native\n");
+    fprintf(stderr, "                top-8. Lower values save a little GPU work but degrade quality;\n");
+    fprintf(stderr, "                do NOT use 1-2: incoherent output.)\n");
     fprintf(stderr, "  --raw         Feed the prompt as raw text (no chat template)\n");
     fprintf(stderr, "  --think       Enable high reasoning effort\n");
     fprintf(stderr, "  --think-low   Enable low reasoning effort (shorter chain-of-thought)\n");
