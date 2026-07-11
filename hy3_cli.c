@@ -125,9 +125,13 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --batch <f>   Batch mode: run every prompt line in file <f> (model loads once).\n");
     fprintf(stderr, "                Each line is one prompt with \\n escaped; blank lines skipped.\n");
     fprintf(stderr, "                Output is framed by <<<HY3_BEGIN i>>> ... <<<HY3_END>>> markers.\n");
+#ifdef HY3_CUDA
     fprintf(stderr, "  --gpu         Use GPU acceleration (CUDA)\n");
     fprintf(stderr, "  --gpu-layers <n>  Number of layers to offload to CUDA GPU\n");
+#endif
+#ifdef HY3_METAL
     fprintf(stderr, "  --metal       Use Metal acceleration (macOS/Apple Silicon, all layers)\n");
+#endif
     fprintf(stderr, "  -h            Show this help\n");
 }
 
@@ -175,13 +179,18 @@ int main(int argc, char **argv) {
             think = 1;
         } else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
             batch_file = argv[++i];
+#ifdef HY3_CUDA
         } else if (strcmp(argv[i], "--gpu") == 0) {
             params.use_gpu = 1;
         } else if (strcmp(argv[i], "--gpu-layers") == 0 && i + 1 < argc) {
             params.gpu_layers = atoi(argv[++i]);
             params.use_gpu = 1;
+#endif
+#ifdef HY3_METAL
         } else if (strcmp(argv[i], "--metal") == 0) {
             use_metal = 1;
+            setenv("HY3_METAL", "1", 1);
+#endif
         } else if (strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;

@@ -25,7 +25,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef HY3_CUDA
 int hy3_gpu_init(hy3_model *m, int n_gpu_layers);
+#endif
+#ifdef HY3_METAL
+int hy3_metal_init(hy3_model *m);
+#endif
 
 /* ============================================================================
  * Config
@@ -549,14 +554,31 @@ static void agent_run(agent_session *s, const char *user_msg) {
  * ============================================================================ */
 
 static void usage(const char *p) {
+#ifdef HY3_CUDA
     fprintf(stderr, "Usage: %s -m <model.gguf> [--gpu-layers N] [-t threads]\n", p);
+#elif defined(HY3_METAL)
+    fprintf(stderr, "Usage: %s -m <model.gguf> [--metal] [-t threads]\n", p);
+#else
+    fprintf(stderr, "Usage: %s -m <model.gguf> [-t threads]\n", p);
+#endif
 }
 
 int main(int argc, char **argv) {
-    const char *mp = NULL; int gl = 0, nt = 4;
+    const char *mp = NULL; int nt = 4;
+#ifdef HY3_CUDA
+    int gl = 0;
+#endif
+#ifdef HY3_METAL
+    int use_metal = 0;
+#endif
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i+1<argc) mp = argv[++i];
+#ifdef HY3_CUDA
         else if (!strcmp(argv[i], "--gpu-layers") && i+1<argc) gl = atoi(argv[++i]);
+#endif
+#ifdef HY3_METAL
+        else if (!strcmp(argv[i], "--metal")) use_metal = 1;
+#endif
         else if (!strcmp(argv[i], "-t") && i+1<argc) nt = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown: %s\n", argv[i]); usage(argv[0]); return 1; }
@@ -566,8 +588,14 @@ int main(int argc, char **argv) {
     hy3_model *m = NULL;
     if (hy3_model_load(&m, mp, nt) || !m)
         { fprintf(stderr, "[agent] load failed\n"); return 1; }
+#ifdef HY3_CUDA
     if (gl > 0 && hy3_gpu_init(m, gl))
         fprintf(stderr, "[agent] GPU init failed, using CPU\n");
+#endif
+#ifdef HY3_METAL
+    if (use_metal && hy3_metal_init(m))
+        fprintf(stderr, "[agent] Metal init failed, using CPU\n");
+#endif
 
     agent_session s; sess_init(&s, m);
     fprintf(stderr, "[agent] ready. Type a request (Ctrl+D to exit).\n\n");
