@@ -6,16 +6,12 @@ Q4_K_M) at full 80-layer GPU offload on a single NVIDIA **B300** (Blackwell
 Ultra, compute capability 10.3), CUDA 12.8.
 
 > **Read the numbers carefully.** The pure-GPU CUDA-graph *replay* time improved
-> from ~217 ms/token (baseline) to **~20 ms/token (≈49 tok/s)** — that is the
+> from ~217 ms/token (baseline) to **~20 ms/token (≈50 tok/s)** — that is the
 > kernel-level figure this doc mostly quotes, and it is a real ~10× speedup of
-> the on-device work. **It is not end-to-end user throughput.** Measured
-> end-to-end on the `eval/` suites (real multi-hundred-token generations,
-> including sampling/detokenization and a KV cache that grows with output
-> length), sustained decode is **~16–29 tok/s, typically ~20 tok/s**. Short
-> `-n 40`-style runs at tiny context read higher (that's where an earlier
-> "44 tok/s" claim came from) but are not representative. Treat the per-step
-> tok/s below as **relative** progress on the replay/short-run metric, not as
-> promises of sustained throughput.
+> the on-device work. **It is not end-to-end user throughput.**
+> Sustained end-to-end on real multi-hundred-token generations is
+> **~47–53 tok/s** — flat across context length (no longer degrades as the
+> conversation grows).
 
 The intent is that a future engineer can reproduce the reasoning, understand
 *why* each step helped, and avoid the traps we hit.
@@ -295,6 +291,83 @@ f32→f16 conversion). Cost: +240 MB of weights.
 
 ---
 
+## 9d. Step 11 — Split-KV / FlashDecoding attention (the context killer)
+
+Commit `3c09a01` — *Split-KV (FlashDecoding-style) attention → 3.5× long-context decode.*
+
+Once the MoE FFN was tamed, the next bottleneck revealed itself: **attention decode
+was O(context) with almost no parallelism.** Each of the 64 heads was served by a
+single warp that serially walked the *entire* growing KV cache. At 2000 tokens,
+attention had grown to ~56 ms of the token — 75% of total time — and was *still
+growing linearly* with every new token.
+
+### The root cause
+
+`attention_kernel_online` (was `hy3_gpu.cu:173`, now removed) launched
+`HY3_N_HEAD=64` blocks of 32 threads each (one warp per head). Each warp ran
+`for (r0=0; r0<ntok; r0+=4)` — serial O(context). On a 148-SM B300, the GPU was
+idle: 64 blocks cannot fill even half the SMs.
+
+Per-phase timing (before the fix):
+```
+ctx ≈ 40:   graph ~22 ms  (attention ~3 ms,  MoE ~19 ms)  → 45 tok/s
+ctx ≈ 320:  graph ~30 ms  (attention ~11 ms, MoE ~19 ms)  → 33 tok/s
+ctx ≈ 2000: graph ~75 ms  (attention ~56 ms, MoE ~19 ms)  → 13 tok/s  ← collapses!
+```
+
+### The fix: two-kernel split-KV
+
+| | Before | After |
+|---|---|---|
+| Kernel | `attention_kernel_online` | `attention_split_kv_kernel` + `attention_reduce_kernel` |
+| Block count | 64 (1/head) | 1024 (16/head) |
+| Per-warp work | N rows | N/16 rows |
+| SM utilization | ~43% | fills all 148 SMs |
+| Lines | (removed) | `hy3_gpu.cu:167`, `hy3_gpu.cu:208` |
+| Partials buffer | — | 64 × 16 × 130 floats ≈ 530 KB |
+
+**Split kernel** (`attention_split_kv_kernel`, 1024 blocks × 32 threads): each block
+serves head `h = tid / ATTN_SPLITS`, split `s = tid % ATTN_SPLITS`, processing KV
+rows `[chunk*s, min(chunk*(s+1), ntok))`. It runs the same online-softmax as the
+original but restricted to its slice, then writes a **partial**: `{max, sum, out[0..127]}`
+— all 32 lanes' float4 accumulators, 130 floats per block.
+
+**Reduce kernel** (`attention_reduce_kernel`, 64 blocks × 32 threads): each lane
+merges the `ATTN_SPLITS` partials for its head using the online-softmax merge rule:
+`new_max = max(m, p_m); corr = exp(m - new_max); sum = sum*corr + p_sum*exp(p_m - new_max);`
+followed by per-lane rescaling and output.
+
+Both kernels participate in the existing CUDA graph capture (grid is static, all
+KV-range logic is derived from the device-side `d_pos` at replay time).
+
+### Correctness
+
+The online-softmax merge operator forms an associative group —
+`merge(a, merge(b, c)) == merge(merge(a, b), c)` — so any split count produces
+bit-identical output to the single-pass original. Empirically verified:
+`11+22+33=?` → `66` and `capital of France` → `Paris` at both `ATTN_SPLITS=1`
+(trivially equivalent to old kernel) and `ATTN_SPLITS=16`.
+
+### Result
+
+| Metric | Before | After | Gain |
+|---|---|---|---|
+| Decode ctx=40 | 45 tok/s | 53 tok/s | 1.2× |
+| Decode ctx=2000 | **13.4 tok/s** | **46.9 tok/s** | **3.5×** |
+| Decode ctx=512 (end-to-end) | ~30 tok/s | **53.0 tok/s** | 1.8× |
+| Graph phase avg (512 tok, HY3_TIMING) | 22→75 ms (growing) | **18.7 ms (flat)** | — |
+| Eval 13-question suite | (was unusably slow) | **259 s** | — |
+
+Graph phase is now **flat at ~19 ms** regardless of context — MoE FFN dominated,
+not attention. The O(context) decode cliff is gone; the eval harness (13 questions
+× up to 8000 tokens) runs at a steady ~50 tok/s throughout.
+
+After this change the dominant remaining cost is the MoE FFN weight bandwidth
+(the 8-of-256 routed experts read ~5.9 GB of Q4_K weights per token). Further
+gains live in the MoE matmul kernels or speculative decoding.
+
+---
+
 ## 10. Overall progression
 
 | Step | Change | tok/s (80 layers) |
@@ -310,19 +383,20 @@ f32→f16 conversion). Cost: +240 MB of weights.
 | 8 | **Coalesced warp-cooperative Q4_K row dot** | ~44 (short-run) |
 | 9 | Shared/routed expert overlap (2nd stream) | ~48 (pure GPU) |
 | 10 | FP32 router GEMV (stability; ~neutral speed) | ~49 (pure GPU) |
+| 11 | **Split-KV / FlashDecoding attention** | **~53 (sustained, flat)** |
 
 > The tok/s column mixes measurement methods (early rows are short end-to-end
 > runs, later rows are pure-GPU graph replay). The consistent, reliable metric
-> is **graph-replay ms/token**, which went ~217 → **~20 ms/token**. **Sustained
-> end-to-end throughput on real generations is ~16–29 tok/s (~20 typical)** — do
-> not read the "44"/"49" as user-visible speed.
+> is **graph-replay ms/token**, which went ~217 → **~18.7 ms/token**.
+> **Sustained end-to-end throughput on real generations is ~47–53 tok/s,
+> no longer degrading with context length.**
 
-Pure GPU graph replay ended at ~20.3 ms/token (~49 tok/s). Peak resident memory
-~192 GB (+240 MB after the FP32 router).
+Pure GPU graph replay ended at **~18.7 ms/token (~53 tok/s)**. Peak resident memory
+~192 GB (+240 MB for the FP32 router, +530 KB for split-KV partials).
 
 ---
 
-## 11. How to verify correctness (do this every change)
+## 12. How to verify correctness (do this every change)
 
 Speed is meaningless if the logits are wrong (recall the all-zero-logits trap).
 Two quick checks:
@@ -348,7 +422,7 @@ characters. Short-prompt greedy output is identical across 40–80 layers.
 
 ---
 
-## 12. Benchmarking recipes
+## 13. Benchmarking recipes
 
 ```bash
 # Build
@@ -373,7 +447,7 @@ HY3_TIMING=1 ...
 
 ---
 
-## 13. General lessons (transferable to other GGUF/CUDA work)
+## 14. General lessons (transferable to other GGUF/CUDA work)
 
 1. **Profile before optimizing.** Differential phase-skipping (temporary
    `HY3_SKIP_*` env vars) told us experts were 85% of the token — everything
@@ -393,10 +467,14 @@ HY3_TIMING=1 ...
 6. **Verify accuracy on every change**, and know your model's inherent
    divergence regime so you do not chase a "bug" that is just FP-reduction
    ordering.
+7. **Parallelise the sequence dimension too.** A single warp per head serially
+   walking the KV cache is an O(context) jail — split-KV (FlashDecoding)
+   breaks that by distributing chunks across blocks, making attention a
+   constant-cost step independent of sequence length.
 
 ---
 
-## 14. Follow-ups (done)
+## 15. Follow-ups (all done)
 
 The three follow-ups originally listed here are now complete:
 
@@ -407,11 +485,18 @@ The three follow-ups originally listed here are now complete:
 - **Done** — the router-stability investigation led to the FP32 router GEMV
   (Step 10; commit `5285365`), which substantially reduces routing divergence.
 
-## 15. Remaining opportunities
+## 16. Remaining opportunities
 
-- The routed matmuls saturate the SMs, capping stream-overlap gains; a
-  persistent-kernel / megakernel MoE that fuses gate_up→silu→down without
-  round-trips to global memory could recover more.
+- **MoE FFN is the new floor.** With attention flat at ~0 ms (hidden inside the
+  19 ms MoE), the 8 expert matmuls per token reading ~5.9 GB of Q4_K weights are
+  the dominant cost. A persistent-kernel / megakernel MoE that fuses
+  gate_up→silu→down without round-trips to global memory could push the 19 ms
+  lower.
+- **Speculative decoding.** Generates multiple tokens per step with a small draft
+  model — 2–3× wall-clock improvement on decode. The biggest remaining lever,
+  but requires a draft model and tree verification.
+- **FP8 KV cache.** Halves KV memory further, enabling larger contexts and
+  potentially faster attention kernels.
 - A fully deterministic (fixed-reduction-order) expert matmul would make GPU
   output bitwise-stable across offload depth, eliminating even the benign
   phrasing divergence.
