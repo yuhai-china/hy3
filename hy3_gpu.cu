@@ -21,7 +21,7 @@ extern "C" {
 
 #define BLOCK_DIM 256
 #define CUDA_QK_K 256
-#define ATTN_SPLITS 64   /* split-KV: parallelise attention over the sequence */
+#define ATTN_SPLITS_MAX 128 /* upper bound for dynamic split-KV; actual splits adapt to ntok */
 
 /* INT8 KV cache: per-head quant, FP16 scale + 128×int8 per head.
  * Slot = 8×(2+128)=1040 bytes  (vs 2048 for FP16) — ~49 % less memory & bandwidth. */
@@ -164,18 +164,18 @@ __global__ void norm_router_gemv_fused_kernel(float*rout,const float*x,const flo
     if(tid==0) rout[row]=sd[0];
 }
 /* split-KV online-softmax attention, INT8 KV cache with per-head FP16 scales.
- * Each head subdivides the KV sequence into ATTN_SPLITS chunks; one warp per
+ * Each head subdivides the KV sequence into nsplits chunks; one warp per
  * chunk computes partials (local max / sum / per-lane accumulator).  A reduce
  * kernel merges all partials for each head.  This parallelises the O(context)
  * attention loop that dominated long-context decode. */
 __global__ void attention_split_kv_kernel(
     const float*q,const uint8_t*kc,const uint8_t*vc,
     int nh,int nkh,int hdim,const int*d_pos,
-    int kvg,int lid,int nl,float*partials)
+    int kvg,int lid,int nl,int nsplits,float*partials)
 {
-    int tid=blockIdx.x,h=tid/ATTN_SPLITS; if(h>=nh) return;
+    int tid=blockIdx.x,h=tid/nsplits; if(h>=nh) return;
     int kvh=h/kvg,ntok=(*d_pos)+1; if(ntok<1) return;
-    int chunk=(ntok+ATTN_SPLITS-1)/ATTN_SPLITS,s=tid%ATTN_SPLITS;
+    int chunk=(ntok+nsplits-1)/nsplits,s=tid%nsplits;
     int rs=s*chunk,re=(rs+chunk<ntok)?(rs+chunk):ntok;
     const float*qh=q+(size_t)h*hdim;
     float scale=rsqrtf((float)hdim); int lane=threadIdx.x&31u;
@@ -218,11 +218,11 @@ __global__ void attention_split_kv_kernel(
 }
 /* Reduce per-head split partials with the same online-softmax merge rule,
  * processing only this thread's lane index across all partials. */
-__global__ void attention_reduce_kernel(float*out,const float*partials,int nh,int hdim){
+__global__ void attention_reduce_kernel(float*out,const float*partials,int nh,int hdim,int nsplits){
     int h=blockIdx.x,lane=threadIdx.x; if(h>=nh) return;
     float ms=-INFINITY,ss=0.f; float4 ov=make_float4(0,0,0,0);
-    for(int s=0;s<ATTN_SPLITS;s++){
-        const float*p=partials+(size_t)(h*ATTN_SPLITS+s)*130; float pms=p[0],pss=p[1];
+    for(int s=0;s<nsplits;s++){
+        const float*p=partials+(size_t)(h*nsplits+s)*130; float pms=p[0],pss=p[1];
         if(pss<=0.f) continue;
         float nm=fmaxf(ms,pms),os=__expf(ms-nm),rs=__expf(pms-nm);
         ss=ss*os+pss*rs;
@@ -294,7 +294,7 @@ typedef struct {
     int *d_router_ids; float *d_router_wts,*d_moe_gate_k,*d_moe_up_k,*d_moe_mid_k,*d_moe_down_k;
     half *d_xf16;  /* F16 activation scratch for cublasGemmEx (max input dim) */
     int *d_pos; int *h_pos;      /* device + pinned-host token position for graph replay */
-    cudaGraphExec_t graph_exec; int graph_ready; int graph_warmed;
+    cudaGraphExec_t graph_exec; int graph_ready; int graph_warmed; int attn_splits;
     uint8_t *graph_kc,*graph_vc;    /* KV cache ptrs baked into graph; realloc -> recapture */
 } gpu_ctx_t;
 
@@ -399,7 +399,8 @@ int hy3_gpu_init(hy3_model *m,int n_gpu_layers){
     CUDA_CHECK(cudaMalloc(&ctx->d_scratch,(HY3_DENSE_INTERMED*2+HY3_N_EMBD*4+HY3_HEAD_DIM*256)*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ctx->d_scratch2,(HY3_N_EXPERT*4+HY3_MOE_INTERMED*8)*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ctx->d_logits,HY3_N_VOCAB*sizeof(float))); ctx->ctx_cap=(int)islots;
-    CUDA_CHECK(cudaMalloc(&ctx->d_attn_partials,(size_t)HY3_N_HEAD*ATTN_SPLITS*130*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_attn_partials,(size_t)HY3_N_HEAD*ATTN_SPLITS_MAX*130*sizeof(float)));
+    ctx->attn_splits=16; /* initial, recaptured to optimal on first graph */
     CUDA_CHECK(cudaMalloc(&ctx->d_router_ids,HY3_N_EXPERT_USED*sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx->d_router_wts,HY3_N_EXPERT_USED*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ctx->d_moe_gate_k,(size_t)HY3_N_EXPERT_USED*HY3_MOE_INTERMED*sizeof(float)));
@@ -466,8 +467,8 @@ static void encode_layer_gpu(gpu_ctx_t*ctx,hy3_model*m,int il){
     gpu_mul_mat(ctx,s,s2,ctx->d_layer_attn_qkv[il],qs+2*kvd,HY3_N_EMBD);
     qk_norm_rope_fused_kernel<<<HY3_N_HEAD+HY3_N_KV_HEAD,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(qg,kg,ctx->d_layer_attn_q_norm[il],ctx->d_layer_attn_k_norm[il],HY3_HEAD_DIM,HY3_N_HEAD,HY3_N_KV_HEAD,ctx->d_pos);
     kv_quantize_int8_kernel<<<HY3_N_KV_HEAD,32,0,ctx->stream>>>(ctx->d_k_cache,ctx->d_v_cache,kg,vg,ctx->d_pos,il,HY3_N_LAYER);
-    attention_split_kv_kernel<<<HY3_N_HEAD*ATTN_SPLITS,32,0,ctx->stream>>>(qg,ctx->d_k_cache,ctx->d_v_cache,HY3_N_HEAD,HY3_N_KV_HEAD,HY3_HEAD_DIM,ctx->d_pos,HY3_N_HEAD/HY3_N_KV_HEAD,il,HY3_N_LAYER,ctx->d_attn_partials);
-    attention_reduce_kernel<<<HY3_N_HEAD,32,0,ctx->stream>>>(ao,ctx->d_attn_partials,HY3_N_HEAD,HY3_HEAD_DIM);
+    attention_split_kv_kernel<<<HY3_N_HEAD*ctx->attn_splits,32,0,ctx->stream>>>(qg,ctx->d_k_cache,ctx->d_v_cache,HY3_N_HEAD,HY3_N_KV_HEAD,HY3_HEAD_DIM,ctx->d_pos,HY3_N_HEAD/HY3_N_KV_HEAD,il,HY3_N_LAYER,ctx->attn_splits,ctx->d_attn_partials);
+    attention_reduce_kernel<<<HY3_N_HEAD,32,0,ctx->stream>>>(ao,ctx->d_attn_partials,HY3_N_HEAD,HY3_HEAD_DIM,ctx->attn_splits);
     gpu_mul_mat(ctx,ao,s,ctx->d_layer_attn_output[il],HY3_N_EMBD,qs);
     /* fused: x += o-proj (s); s = rmsnorm(x)*ffn_norm  (one kernel, no gap) */
     add_rmsnorm_kernel<<<1,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(s,x,s,ctx->d_layer_ffn_norm[il],HY3_N_EMBD);
@@ -504,10 +505,20 @@ static void encode_layer_gpu(gpu_ctx_t*ctx,hy3_model*m,int il){
     }
 }
 
+/* Pick a split count that keeps per-block work ≈32 tokens for best latency. */
+static int gpu_optimal_splits(int ntok){
+    int s=ntok/32; if(s<16)s=16; if(s>ATTN_SPLITS_MAX)s=ATTN_SPLITS_MAX; return s;
+}
+
 /* Capture (once) and replay the full 80-layer forward as a CUDA graph.
  * Collapses ~1700 host-issued kernel/cuBLAS launches per token into one
  * graph launch, removing the launch-latency that dominates batch-1 decode. */
 static void gpu_decode_graph(gpu_ctx_t*ctx,hy3_model*m){
+    int ntok=*ctx->h_pos+1, opt=gpu_optimal_splits(ntok);
+    if(opt!=ctx->attn_splits){
+        if(ctx->graph_ready){cudaGraphExecDestroy(ctx->graph_exec);ctx->graph_ready=0;}
+        ctx->attn_splits=opt;
+    }
     if(!ctx->graph_ready||ctx->graph_kc!=ctx->d_k_cache||ctx->graph_vc!=ctx->d_v_cache){
         if(ctx->graph_ready){cudaGraphExecDestroy(ctx->graph_exec);ctx->graph_ready=0;}
         cudaGraph_t g;
@@ -517,7 +528,7 @@ static void gpu_decode_graph(gpu_ctx_t*ctx,hy3_model*m){
         CUDA_CHECK(cudaGraphInstantiate(&ctx->graph_exec,g,0));
         cudaGraphDestroy(g);
         ctx->graph_ready=1; ctx->graph_kc=ctx->d_k_cache; ctx->graph_vc=ctx->d_v_cache;
-        if(getenv("HY3_TIMING")) fprintf(stderr,"hy3_gpu: captured decode graph\n");
+        if(getenv("HY3_TIMING")) fprintf(stderr,"hy3_gpu: captured decode graph (splits=%d)\n",ctx->attn_splits);
     }
     if(getenv("HY3_GRAPH_BENCH")){
         cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b);
@@ -581,8 +592,9 @@ int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
             gpu_ensure_kv_capacity(ctx,kvl+1);
             kv_quantize_int8_kernel<<<HY3_N_KV_HEAD,32,0,ctx->stream>>>(ctx->d_k_cache,ctx->d_v_cache,kg,vg,ctx->d_pos,il,HY3_N_LAYER);
             {float*hk=m->cache_k+(size_t)kvl*kvd,*hv=m->cache_v+(size_t)kvl*kvd;CUDA_CHECK(cudaMemcpyAsync(hk,kg,kvd*sizeof(float),cudaMemcpyDeviceToHost,ctx->stream));CUDA_CHECK(cudaMemcpyAsync(hv,vg,kvd*sizeof(float),cudaMemcpyDeviceToHost,ctx->stream));}
-            attention_split_kv_kernel<<<HY3_N_HEAD*ATTN_SPLITS,32,0,ctx->stream>>>(qg,ctx->d_k_cache,ctx->d_v_cache,HY3_N_HEAD,HY3_N_KV_HEAD,HY3_HEAD_DIM,ctx->d_pos,HY3_N_HEAD/HY3_N_KV_HEAD,il,HY3_N_LAYER,ctx->d_attn_partials);
-            attention_reduce_kernel<<<HY3_N_HEAD,32,0,ctx->stream>>>(ao,ctx->d_attn_partials,HY3_N_HEAD,HY3_HEAD_DIM);
+            int ns=gpu_optimal_splits(tp+1);
+            attention_split_kv_kernel<<<HY3_N_HEAD*ns,32,0,ctx->stream>>>(qg,ctx->d_k_cache,ctx->d_v_cache,HY3_N_HEAD,HY3_N_KV_HEAD,HY3_HEAD_DIM,ctx->d_pos,HY3_N_HEAD/HY3_N_KV_HEAD,il,HY3_N_LAYER,ns,ctx->d_attn_partials);
+            attention_reduce_kernel<<<HY3_N_HEAD,32,0,ctx->stream>>>(ao,ctx->d_attn_partials,HY3_N_HEAD,HY3_HEAD_DIM,ns);
             gpu_mul_mat(ctx,ao,s,ctx->d_layer_attn_output[il],HY3_N_EMBD,qs);
             add_kernel<<<(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(x,x,s,HY3_N_EMBD);
             if(il<HY3_N_LAYER_DENSE){
