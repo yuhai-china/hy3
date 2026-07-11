@@ -21,7 +21,7 @@ extern "C" {
 
 #define BLOCK_DIM 256
 #define CUDA_QK_K 256
-#define ATTN_SPLITS 16   /* split-KV: parallelise attention over the sequence */
+#define ATTN_SPLITS 32   /* split-KV: parallelise attention over the sequence */
 
 typedef struct { uint16_t d, dmin; uint8_t scales[12]; uint8_t qs[CUDA_QK_K/2]; } cuda_block_q4_K;
 
@@ -176,19 +176,19 @@ __global__ void attention_split_kv_kernel(
     float scale=rsqrtf((float)hdim); int lane=threadIdx.x&31u;
     float4 qv=((const float4*)qh)[lane];
     float ms=-INFINITY,ss=0.f; float4 ov=make_float4(0,0,0,0);
-    __shared__ float4 kvs[4*32*2],osh[32];
+    __shared__ float4 kvs[8*32*2],osh[32];
     /* empty split → zero partials (reduce skips pss<=0) */
     if(rs>=re){ osh[lane]=make_float4(0,0,0,0); __syncthreads();
         if(lane==0){ float*p=partials+(size_t)tid*130; p[0]=-INFINITY;p[1]=0.f;
             for(int i=0;i<128;i++) p[2+i]=0.f; } return; }
-    for(int r0=rs;r0<re;r0+=4){
-        int nr=(re-r0<4)?(re-r0):4;
+    for(int r0=rs;r0<re;r0+=8){
+        int nr=(re-r0<8)?(re-r0):8;
         for(int off=threadIdx.x;off<nr*32;off+=blockDim.x){
             int r=off/32,c=off&31,t=r0+r;
             size_t base=(size_t)(t*nl+lid)*nkh*hdim+(size_t)kvh*hdim;
             const half*kh=kc+base,*vh=vc+base; float4 tm; int c4=c*4;
-            tm.x=__half2float(kh[c4+0]);tm.y=__half2float(kh[c4+1]);tm.z=__half2float(kh[c4+2]);tm.w=__half2float(kh[c4+3]); kvs[off]=tm;
-            tm.x=__half2float(vh[c4+0]);tm.y=__half2float(vh[c4+1]);tm.z=__half2float(vh[c4+2]);tm.w=__half2float(vh[c4+3]); kvs[nr*32+off]=tm;
+            tm.x=__half2float(__ldg(kh+c4+0));tm.y=__half2float(__ldg(kh+c4+1));tm.z=__half2float(__ldg(kh+c4+2));tm.w=__half2float(__ldg(kh+c4+3)); kvs[off]=tm;
+            tm.x=__half2float(__ldg(vh+c4+0));tm.y=__half2float(__ldg(vh+c4+1));tm.z=__half2float(__ldg(vh+c4+2));tm.w=__half2float(__ldg(vh+c4+3)); kvs[nr*32+off]=tm;
         }
         __syncthreads();
         for(int r=0;r<nr;r++){
