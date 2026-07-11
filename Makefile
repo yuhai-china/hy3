@@ -61,7 +61,7 @@ CUDA_LIBS ?= -lcublas -lcudart
 
 .PHONY: all clean
 
-all: hy3 hy3-cli hy3-convert
+all: hy3 hy3-cli hy3-convert hy3-agent
 
 # --- Backend selection -----------------------------------------------
 # Linux + CUDA toolkit present -> CUDA backend (hy3_gpu.cu, --gpu-layers).
@@ -85,6 +85,12 @@ hy3: hy3_cuda.o hy3.o hy3_cli.o
 hy3-cli: hy3_cuda.o hy3.o hy3_cli.o
 	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(CUDA_LIBS) -lm -lpthread
 
+hy3-agent: hy3_cuda.o hy3.o hy3_agent.o
+	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(CUDA_LIBS) -lm -lpthread
+
+hy3_agent.o: hy3_agent.c hy3.h
+	$(CC) $(CFLAGS) -c -o $@ hy3_agent.c
+
 hy3_cuda.o: hy3_gpu.cu hy3.h
 	$(NVCC) $(NVCC_FLAGS) -c -o $@ hy3_gpu.cu
 
@@ -99,6 +105,9 @@ hy3: hy3_metal.o hy3.o hy3_cli.o
 hy3-cli: hy3_metal.o hy3.o hy3_cli.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS) $(METAL_LIBS)
 
+hy3-agent: hy3_metal.o hy3.o hy3_agent.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS) $(METAL_LIBS)
+
 hy3_metal.o: hy3_metal.m hy3.h
 	$(CC) $(OBJC_FLAGS) -c -o $@ hy3_metal.m
 
@@ -107,6 +116,9 @@ hy3: hy3.o hy3_cli.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 hy3-cli: hy3.o hy3_cli.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+hy3-agent: hy3.o hy3_agent.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 endif
 
@@ -124,4 +136,4 @@ fast_metal: fast_metal.m
 	$(CC) -O3 -fobjc-arc -o $@ fast_metal.m -framework Metal -framework Foundation
 
 clean:
-	rm -f hy3 hy3-cli hy3-convert fast_metal *.o
+	rm -f hy3 hy3-cli hy3-convert hy3-agent fast_metal *.o
