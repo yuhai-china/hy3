@@ -42,7 +42,7 @@ step-by-step optimization history lives in dedicated docs:
 
 ### Apple Silicon Metal performance
 
-Single **M4 Pro** (24-core GPU), full offload of the same ~162 GB
+Single **M2 Ultra** (192 GB unified memory), full offload of the same ~162 GB
 `hy3_q4k_mixed.gguf`, end-to-end on real generations:
 
 | Metric | Before | After (split-KV) | Gain |
