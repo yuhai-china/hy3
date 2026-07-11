@@ -18,7 +18,7 @@ The project is called **hy3**.
 Supports **CPU**, **CUDA**, and **Metal**. All verified.
 
 On a single **NVIDIA B300** (80-layer GPU offload, ~162 GB GGUF):
-decode reaches **~50 tok/s** end-to-end, flat across context length.
+**~50 tok/s** end-to-end, flat across context length.
 
 On **M2 Ultra** (192 GB): ~22 tok/s after split-KV.
 
