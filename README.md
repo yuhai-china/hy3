@@ -266,28 +266,3 @@ norms/router/bias. This is smaller *and* higher average precision on the hot
 path than a naive "everything but experts F32" baseline
 (198.58GB → 173.78GB on the reference checkpoint).
 
-## Known limitations
-
-- **High-layer routing divergence (benign).** Across GPU offload depth the
-  greedy output can eventually diverge from a shallower run, but only as
-  benign phrasing/formatting — never wrong answers: a hard top-k MoE
-  tie-break flips under floating-point drift accumulated over more layers.
-  Moving the router GEMV to FP32 (see `docs/CUDA_OPTIMIZATION.md`) greatly
-  reduced this, and short-prompt greedy output is identical across 40–80
-   layers. Separately, keep the default `-experts 8`: lowering it degrades
-   quality (see "Keep the default: `-experts 8`"), and `-experts 2`/`1` produce
-   incoherent gibberish (a model-capacity floor, not a bug).
-- The CUDA and Metal backends re-derive the current token's absolute
-  position from `cache_len / HY3_N_LAYER` each call rather than tracking it
-  incrementally; correct, marginally wasteful.
-- The tokenizer (`hy3_tokenize` in hy3.c) is a greedy longest-prefix-match
-  over the whole vocabulary, not a proper BPE merge algorithm. This happens
-  to agree with the real tokenizer for plain ASCII prompts (verified for
-  `"11+22+33=?"`), but is not guaranteed to match in general, particularly
-  for text requiring the GPT-2-style byte-level unicode escaping.
-- `attention()`/`attention_kernel`/`attention` (Metal) cap attended history
-  at 8192 tokens *per layer* by truncating to the first 8192 rather than a
-  sliding window; sequences longer than that will attend incorrectly (not
-  to "recent" context) rather than erroring out. Matches the model's
-  `max_position_embeddings` only up to that length; long-context use beyond
-  8192 tokens needs real work, not just raising the constant.
