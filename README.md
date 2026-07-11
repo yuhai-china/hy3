@@ -20,7 +20,7 @@ Supports **CPU**, **CUDA**, and **Metal**. All verified.
 On a single **NVIDIA B300** (80-layer GPU offload, ~162 GB GGUF):
 **~50 tok/s** end-to-end, flat across context length.
 
-On **M2 Ultra** (192 GB): ~22 tok/s after split-KV.
+On **M2 Ultra** (192 GB): **~22 tok/s**.
 
 Full optimization history → [`docs/CUDA_OPTIMIZATION.md`](docs/CUDA_OPTIMIZATION.md)
 ([中文](docs/CUDA_OPTIMIZATION.zh.md)) and [`docs/METAL_OPTIMIZATION.md`](docs/METAL_OPTIMIZATION.md).
