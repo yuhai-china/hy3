@@ -9,6 +9,7 @@ extern "C" {
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <float.h>
+#include <time.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -79,29 +80,35 @@ __global__ void router_topk_kernel(const float*logits,const float*bias,int*out_i
  * row via full-warp reduction; grid.x = ceil(M/WPB), grid.y = slot. Gives
  * ~M/8 * nu blocks (e.g. 1536 for gate) vs the old 24 -- full SM occupancy
  * hides the Q4_K dequant + weight-read latency that was ~85% of decode time. */
-#define MOE_WPB 8   /* warps per block */
+#define MOE_WPB 8   /* warps per block (8 warps = 256 threads; safe & fast) */
 __global__ static void moe_matmul_q4k_id_kernel(float*dst,const uint8_t*const*ptrs,
     const float*x,const int*ids,uint32_t n,uint32_t M,uint32_t xps){
+    __shared__ float sxs[HY3_N_EMBD];
     uint32_t slot=blockIdx.y; int eid=ids[slot];
-    const uint8_t*w=ptrs[eid]; const float*xs=xps?(x+(uint64_t)slot*n):x;
+    const uint8_t*w=ptrs[eid]; const float*xg=xps?(x+(uint64_t)slot*n):x;
+    for(uint32_t i=threadIdx.x;i<n;i+=blockDim.x) sxs[i]=xg[i];
+    __syncthreads();
     uint32_t warp=threadIdx.x>>5,lane=threadIdx.x&31u,nb=n/CUDA_QK_K;
     uint32_t row=blockIdx.x*MOE_WPB+warp; if(row>=M) return;
     const cuda_block_q4_K*wr=(const cuda_block_q4_K*)(w+(uint64_t)row*(uint64_t)nb*sizeof(cuda_block_q4_K));
-    float acc=warp_row_dot_q4k(wr,xs,nb,lane);
+    float acc=warp_row_dot_q4k(wr,sxs,nb,lane);
     for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffffu,acc,o);
     if(lane==0) dst[(uint64_t)slot*M+row]=acc;
 }
 __global__ static void moe_matmul_q4k_id_gate_up_kernel(float*go,float*uo,
     const uint8_t*const*gp,const uint8_t*const*up,const float*x,const int*ids,
     uint32_t n,uint32_t M,uint32_t xps){
+    __shared__ float sxs[HY3_N_EMBD];
     uint32_t slot=blockIdx.y; int eid=ids[slot];
-    const uint8_t*gw=gp[eid],*uw=up[eid]; const float*xs=xps?(x+(uint64_t)slot*n):x;
+    const uint8_t*gw=gp[eid],*uw=up[eid]; const float*xg=xps?(x+(uint64_t)slot*n):x;
+    for(uint32_t i=threadIdx.x;i<n;i+=blockDim.x) sxs[i]=xg[i];
+    __syncthreads();
     uint32_t warp=threadIdx.x>>5,lane=threadIdx.x&31u,nb=n/CUDA_QK_K;
     uint32_t row=blockIdx.x*MOE_WPB+warp; if(row>=M) return;
     uint64_t rb=(uint64_t)nb*sizeof(cuda_block_q4_K);
     const cuda_block_q4_K*gr=(const cuda_block_q4_K*)(gw+(uint64_t)row*rb);
     const cuda_block_q4_K*ur=(const cuda_block_q4_K*)(uw+(uint64_t)row*rb);
-    float g=warp_row_dot_q4k(gr,xs,nb,lane),u=warp_row_dot_q4k(ur,xs,nb,lane);
+    float g=warp_row_dot_q4k(gr,sxs,nb,lane),u=warp_row_dot_q4k(ur,sxs,nb,lane);
     for(int o=16;o>0;o>>=1){ g+=__shfl_down_sync(0xffffffffu,g,o); u+=__shfl_down_sync(0xffffffffu,u,o); }
     if(lane==0){ go[(uint64_t)slot*M+row]=g; uo[(uint64_t)slot*M+row]=u; }
 }
@@ -422,10 +429,10 @@ static void encode_layer_gpu(gpu_ctx_t*ctx,hy3_model*m,int il){
         CUDA_CHECK(cudaEventRecord(ctx->ev_fork,ctx->stream));
         CUDA_CHECK(cudaStreamWaitEvent(ctx->stream2,ctx->ev_fork,0));
         int gg=(HY3_MOE_INTERMED+MOE_WPB-1)/MOE_WPB;
-        moe_matmul_q4k_id_gate_up_kernel<<<dim3(gg,nu),256,0,ctx->stream2>>>(ctx->d_moe_gate_k,ctx->d_moe_up_k,(const uint8_t*const*)ctx->d_gate_ptrs[il],(const uint8_t*const*)ctx->d_up_ptrs[il],s,ctx->d_router_ids,HY3_N_EMBD,HY3_MOE_INTERMED,0);
+        moe_matmul_q4k_id_gate_up_kernel<<<dim3(gg,nu),MOE_WPB*32,0,ctx->stream2>>>(ctx->d_moe_gate_k,ctx->d_moe_up_k,(const uint8_t*const*)ctx->d_gate_ptrs[il],(const uint8_t*const*)ctx->d_up_ptrs[il],s,ctx->d_router_ids,HY3_N_EMBD,HY3_MOE_INTERMED,0);
         silu_mul_kernel<<<(nu*HY3_MOE_INTERMED+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream2>>>(ctx->d_moe_mid_k,ctx->d_moe_gate_k,ctx->d_moe_up_k,nu*HY3_MOE_INTERMED);
         int gd=(HY3_N_EMBD+MOE_WPB-1)/MOE_WPB;
-        moe_matmul_q4k_id_kernel<<<dim3(gd,nu),256,0,ctx->stream2>>>(ctx->d_moe_down_k,(const uint8_t*const*)ctx->d_down_ptrs[il],ctx->d_moe_mid_k,ctx->d_router_ids,HY3_MOE_INTERMED,HY3_N_EMBD,1);
+        moe_matmul_q4k_id_kernel<<<dim3(gd,nu),MOE_WPB*32,0,ctx->stream2>>>(ctx->d_moe_down_k,(const uint8_t*const*)ctx->d_down_ptrs[il],ctx->d_moe_mid_k,ctx->d_router_ids,HY3_MOE_INTERMED,HY3_N_EMBD,1);
         CUDA_CHECK(cudaEventRecord(ctx->ev_join,ctx->stream2));
         float*sg=(float*)ctx->d_scratch2+HY3_N_EXPERT*2,*su=sg+HY3_MOE_INTERMED;
         gpu_mul_mat(ctx,s,sg,ctx->d_layer_ffn_gateup_shexp[il],2*HY3_MOE_INTERMED,HY3_N_EMBD);
@@ -466,11 +473,16 @@ static void gpu_decode_graph(gpu_ctx_t*ctx,hy3_model*m){
     CUDA_CHECK(cudaGraphLaunch(ctx->graph_exec,ctx->stream));
 }
 
+static double now_sec_cpu(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (double)ts.tv_sec+(double)ts.tv_nsec*1e-9; }
 int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
     gpu_ctx_t*ctx=(gpu_ctx_t*)m->gpu_ctx; if(!ctx)return -1;
     int kvs=HY3_N_KV_HEAD*HY3_HEAD_DIM,ng=m->gpu_layers;
     if(ng<=0)ng=HY3_N_LAYER; if(ng>HY3_N_LAYER)ng=HY3_N_LAYER;
     int fg=(ng>=HY3_N_LAYER),kvd=HY3_N_KV_HEAD*HY3_HEAD_DIM;
+    /* ---- per-phase timing (HY3_TIMING only) ---- */
+    static double tp_graph=0,tp_final=0,tp_dtoh=0; static long tp_n=0;
+    double tpg0=0,tpg1=0,tpf0=0,tpf1=0,tpd0=0;
+    int do_tp = getenv("HY3_TIMING")!=NULL;
     for(int i=0;i<tokens->len;i++){
         int token=tokens->v[i],cb=m->cache_len,tp=cb/HY3_N_LAYER;
         size_t nd=(size_t)(cb+HY3_N_LAYER)*kvs;
@@ -481,6 +493,7 @@ int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
         /* device-side token position for graph replay */
         *ctx->h_pos=tp;
         CUDA_CHECK(cudaMemcpyAsync(ctx->d_pos,ctx->h_pos,sizeof(int),cudaMemcpyHostToDevice,ctx->stream));
+        if(do_tp){ tpg0=now_sec_cpu(); tpg1=tpg0; }
 
         if(fg){
             /* Full-GPU: ensure KV capacity (host-side, may realloc), then
@@ -489,6 +502,7 @@ int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
             gpu_ensure_kv_capacity(ctx,cb+HY3_N_LAYER,kvd);
             if(!ctx->graph_warmed){ for(int il=0;il<HY3_N_LAYER;il++) encode_layer_gpu(ctx,m,il); ctx->graph_warmed=1; }
             else gpu_decode_graph(ctx,m);
+            if(do_tp){ cudaStreamSynchronize(ctx->stream); tpg1=now_sec_cpu(); }
             m->cache_len=cb+HY3_N_LAYER;
             continue;
         }
@@ -525,10 +539,10 @@ int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
                 gpu_mul_mat(ctx,s,sg,ctx->d_layer_ffn_gateup_shexp[il],2*HY3_MOE_INTERMED,HY3_N_EMBD);
                 silu_mul_kernel<<<(HY3_MOE_INTERMED+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(s2,sg,su,HY3_MOE_INTERMED);
                 int gg=(HY3_MOE_INTERMED+MOE_WPB-1)/MOE_WPB;
-                moe_matmul_q4k_id_gate_up_kernel<<<dim3(gg,nu),256,0,ctx->stream>>>(ctx->d_moe_gate_k,ctx->d_moe_up_k,(const uint8_t*const*)ctx->d_gate_ptrs[il],(const uint8_t*const*)ctx->d_up_ptrs[il],s,ctx->d_router_ids,HY3_N_EMBD,HY3_MOE_INTERMED,0);
+                moe_matmul_q4k_id_gate_up_kernel<<<dim3(gg,nu),MOE_WPB*32,0,ctx->stream>>>(ctx->d_moe_gate_k,ctx->d_moe_up_k,(const uint8_t*const*)ctx->d_gate_ptrs[il],(const uint8_t*const*)ctx->d_up_ptrs[il],s,ctx->d_router_ids,HY3_N_EMBD,HY3_MOE_INTERMED,0);
                 silu_mul_kernel<<<(nu*HY3_MOE_INTERMED+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(ctx->d_moe_mid_k,ctx->d_moe_gate_k,ctx->d_moe_up_k,nu*HY3_MOE_INTERMED);
                 int gd=(HY3_N_EMBD+MOE_WPB-1)/MOE_WPB;
-                moe_matmul_q4k_id_kernel<<<dim3(gd,nu),256,0,ctx->stream>>>(ctx->d_moe_down_k,(const uint8_t*const*)ctx->d_down_ptrs[il],ctx->d_moe_mid_k,ctx->d_router_ids,HY3_MOE_INTERMED,HY3_N_EMBD,1);
+                moe_matmul_q4k_id_kernel<<<dim3(gd,nu),MOE_WPB*32,0,ctx->stream>>>(ctx->d_moe_down_k,(const uint8_t*const*)ctx->d_down_ptrs[il],ctx->d_moe_mid_k,ctx->d_router_ids,HY3_MOE_INTERMED,HY3_N_EMBD,1);
                 gpu_mul_mat(ctx,s2,s,ctx->d_layer_ffn_down_shexp[il],HY3_N_EMBD,HY3_MOE_INTERMED);
                 add_kernel<<<(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(x,x,s,HY3_N_EMBD);
                 moe_combine_id_kernel<<<(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(x,ctx->d_moe_down_k,ctx->d_router_wts,HY3_N_EMBD,(uint32_t)nu);
@@ -538,10 +552,15 @@ int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
         CUDA_CHECK(cudaMemcpyAsync(m->embed,ctx->d_embed,HY3_N_EMBD*sizeof(float),cudaMemcpyDeviceToHost,ctx->stream));CUDA_CHECK(cudaStreamSynchronize(ctx->stream));for(int il=ng;il<HY3_N_LAYER;il++){int p=cb/HY3_N_LAYER;if(il<HY3_N_LAYER_DENSE)forward_layer_dense(m,il,p);else forward_layer_moe(m,il,p);}CUDA_CHECK(cudaMemcpyAsync(ctx->d_embed,m->embed,HY3_N_EMBD*sizeof(float),cudaMemcpyHostToDevice,ctx->stream));
         m->cache_len=cb+HY3_N_LAYER;
     }
+    if(do_tp) tpf0=now_sec_cpu();
     if(ctx->d_output_norm)gpu_rms_norm(ctx,ctx->d_embed,ctx->d_embed,ctx->d_output_norm,HY3_N_EMBD);
     gpu_mul_mat(ctx,ctx->d_embed,ctx->d_logits,ctx->d_output,HY3_N_VOCAB,HY3_N_EMBD);
+    if(do_tp){ cudaStreamSynchronize(ctx->stream); tpf1=now_sec_cpu(); tpd0=now_sec_cpu(); }
     CUDA_CHECK(cudaMemcpyAsync(logits,ctx->d_logits,HY3_N_VOCAB*sizeof(float),cudaMemcpyDeviceToHost,ctx->stream));
     CUDA_CHECK(cudaStreamSynchronize(ctx->stream)); *pos=m->cache_len;
+    if(do_tp){ double tpd1=now_sec_cpu(); tp_graph+=tpg1-tpg0; tp_final+=tpf1-tpf0; tp_dtoh+=tpd1-tpd0; tp_n++;
+        if(tp_n%64==0) fprintf(stderr,"hy3_gpu: phases | graph %.2f final(matmul+norm) %.2f dtoh(logits) %.2f ms (avg %ld tok)\n",
+            1000*tp_graph/tp_n,1000*tp_final/tp_n,1000*tp_dtoh/tp_n,tp_n); }
     return 0;
 }
 #ifdef __cplusplus

@@ -182,33 +182,31 @@ Key flags (`./hy3-cli -h` for the full list): `-n` tokens to generate,
 reproducible comparisons), `-top_k`/`-top_p`, `-t` CPU thread count,
 `-experts` MoE experts activated per token.
 
-### Recommended: `-experts 4`
+### Keep the default: `-experts 8`
 
-The checkpoint is natively top-8. Running with `-experts 4` (only the 4
-highest-scoring routed experts per token) is a reasonable default — **same
-quality, less GPU work** — but be clear about the size of the win:
+The checkpoint is natively top-8; that is the recommended and default setting.
+Lowering `-experts` saves a little GPU work but **measurably degrades quality**,
+so it is not recommended.
 
-| Suite (CUDA, `--gpu-layers 80`, think off) | `-experts 8` | `-experts 4` |
-|--------------------------------------------|:------------:|:------------:|
-| Reasoning/coding benchmark (13 tasks, `temp 1.0`) | 9/13 | 10/13 |
-| Tool-calling (6 cases, `temp 0` greedy) | 5/6 | 5/6 |
-| Pure-GPU graph replay (ms/token, small ctx) | ~20.1 | ~16.1 |
-| **End-to-end decode (eval suites)** | **~21 tok/s** | **~21 tok/s** |
+`-experts 4` was previously suggested as "equal quality, faster." A same-config
+comparison (CUDA, `--gpu-layers 80`, think off, **`temp 0` greedy**) does not
+support that: at `-experts 4` the model produces character-level corruption that
+`-experts 8` does not — e.g. `ALL TESTS PASS` (dropped "ED"), `STRRESS TEST
+DONE`, `SEGMENT TRREE OK`, and an outright crash on the multi-head-attention
+task. Because greedy decoding is deterministic, these are real routing-capacity
+losses, not sampling noise. The earlier "10/13 at `-experts 4`" number came from
+a `temp=1.0` run and was misleading.
 
-Quality is indistinguishable (tool-calling identical; 9-vs-10 is within
-`temp=1.0` noise). On-device, `-experts 4` genuinely does ~half the routed
-matmul work and the pure-GPU kernel time drops ~20% (20.1 → 16.1 ms/token).
-**But end-to-end throughput is essentially the same (~21 tok/s)** — the ~4
-ms/token saved is a small slice of the real per-token cost, which is dominated
-by sampling (120K-vocab top-k/top-p), detokenization, host overhead, and
-attention over a growing KV cache. So pick `-experts 4` to save compute/energy
-at equal quality, not because it feels faster; use `-experts 8` for the model's
-native routing. Reproduce with `HY3_EVAL_EXPERTS` / `HY3_TOOL_EXPERTS` (`eval/`).
+The on-device savings are also small in practice: `-experts 4` roughly halves the
+routed matmul work, but end-to-end decode is dominated by the per-token graph,
+120K-vocab sampling, detokenization, and attention over a growing KV cache, so
+the net throughput gain is only a few percent. Not worth the quality hit.
 
-**Do not go below `-experts 3`.** `-experts 2` (and `1`) produce incoherent
-gibberish — verified at both `--gpu-layers 20` and `80` with greedy decoding, so
-it is a model-capacity floor, not a backend bug: this top-8 checkpoint loses too
-much routed-FFN capacity below ~3 activated experts.
+If you nonetheless want to trade quality for a small speed/energy saving, you can
+set `-experts 4` (or use `HY3_EVAL_EXPERTS` / `HY3_TOOL_EXPERTS`), but **do not go
+below `-experts 3`**: `-experts 2` (and `1`) produce incoherent gibberish —
+verified at both `--gpu-layers 20` and `80` with greedy decoding, a model-capacity
+floor rather than a backend bug.
 
 ### Sizing GPU/Metal offload
 
@@ -287,9 +285,9 @@ path than a naive "everything but experts F32" baseline
   tie-break flips under floating-point drift accumulated over more layers.
   Moving the router GEMV to FP32 (see `docs/CUDA_OPTIMIZATION.md`) greatly
   reduced this, and short-prompt greedy output is identical across 40–80
-  layers. Separately, do **not** go below `-experts 3`: `-experts 2`/`1`
-  produce incoherent gibberish (a model-capacity floor, not a bug — see
-  "Recommended: `-experts 4`").
+   layers. Separately, keep the default `-experts 8`: lowering it degrades
+   quality (see "Keep the default: `-experts 8`"), and `-experts 2`/`1` produce
+   incoherent gibberish (a model-capacity floor, not a bug).
 - The CUDA and Metal backends re-derive the current token's absolute
   position from `cache_len / HY3_N_LAYER` each call rather than tracking it
   incrementally; correct, marginally wasteful.
