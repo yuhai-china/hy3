@@ -38,7 +38,20 @@ step-by-step optimization history lives in dedicated docs:
 - **[`docs/CUDA_OPTIMIZATION.md`](docs/CUDA_OPTIMIZATION.md)** — CUDA decode
   4.6 → ~53 tok/s (also [`docs/CUDA_OPTIMIZATION.zh.md`](docs/CUDA_OPTIMIZATION.zh.md), 中文).
 - **[`docs/METAL_OPTIMIZATION.md`](docs/METAL_OPTIMIZATION.md)** — Metal backend
-  optimization notes and suggestions.
+  optimization notes, the same split-KV attention port, and follow-up suggestions.
+
+### Apple Silicon Metal performance
+
+Single **M4 Pro** (24-core GPU), full offload of the same ~162 GB
+`hy3_q4k_mixed.gguf`, end-to-end on real generations:
+
+| Metric | Before | After (split-KV) | Gain |
+|---|---|---|---|
+| Generation (decode) | 10.1 tok/s | **22.2 tok/s** | **+120% (2.2×)** |
+| Prefill (prompt) | 19.9 tok/s | 23.2 tok/s | +17% |
+
+Same split-KV / FlashDecoding attention technique as CUDA (commit `2db386c`),
+ported to Metal (`hy3.metal`, `hy3_metal.m`).
 
 > **Build note (CUDA):** use the plain `sm_90`/`sm_100`/`compute_100` nvcc arch
 > flags the Makefile ships with. The `-a`-suffixed variants (`sm_90a`,
