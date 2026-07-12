@@ -87,6 +87,7 @@ typedef struct {
     id<MTLComputePipelineState> pipe_rope;
     id<MTLComputePipelineState> pipe_attention;
     id<MTLComputePipelineState> pipe_attention_split;
+    id<MTLComputePipelineState> pipe_attention_split_q8;
     id<MTLComputePipelineState> pipe_attention_reduce;
     id<MTLComputePipelineState> pipe_matmul_f32;
     id<MTLComputePipelineState> pipe_matmul_f16;
@@ -95,6 +96,7 @@ typedef struct {
     id<MTLComputePipelineState> pipe_matmul_q4_k;
     id<MTLComputePipelineState> pipe_matmul_q4_k_mm;
     id<MTLComputePipelineState> pipe_kv_cache_write;
+    id<MTLComputePipelineState> pipe_kv_cache_write_q8;
     id<MTLComputePipelineState> pipe_touch;
 
     /* Fast MoE path pipelines. */
@@ -140,6 +142,10 @@ typedef struct {
 
     id<MTLBuffer> d_k_cache;
     id<MTLBuffer> d_v_cache;
+    id<MTLBuffer> d_k_cache_q8;
+    id<MTLBuffer> d_v_cache_q8;
+    id<MTLBuffer> d_k_scales;
+    id<MTLBuffer> d_v_scales;
     int ctx_cap_slots; /* capacity of d_k_cache/d_v_cache in interleaved slots */
     int concurrent;    /* 1 = concurrent encoder; helpers skip auto barriers and
                         * the caller inserts explicit barriers at dependency edges */
@@ -597,15 +603,19 @@ static void m_rope(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
 static void m_kv_cache_write(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
                               int dst_slot, uint32_t kv_size) {
     uint32_t slot_u = (uint32_t)dst_slot;
-    [enc setComputePipelineState:ctx->pipe_kv_cache_write];
-    [enc setBuffer:ctx->d_k_cache offset:0 atIndex:0];
-    [enc setBuffer:ctx->d_v_cache offset:0 atIndex:1];
-    [enc setBuffer:ctx->d_k offset:0 atIndex:2];
-    [enc setBuffer:ctx->d_v offset:0 atIndex:3];
-    [enc setBytes:&kv_size length:sizeof(kv_size) atIndex:4];
-    [enc setBytes:&slot_u length:sizeof(slot_u) atIndex:5];
-    NSUInteger tg = 256;
-    [enc dispatchThreadgroups:MTLSizeMake((kv_size + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    uint32_t n_kv_heads = HY3_N_KV_HEAD;
+    [enc setComputePipelineState:ctx->pipe_kv_cache_write_q8];
+    [enc setBuffer:ctx->d_k_cache_q8 offset:0 atIndex:0];
+    [enc setBuffer:ctx->d_v_cache_q8 offset:0 atIndex:1];
+    [enc setBuffer:ctx->d_k_scales  offset:0 atIndex:2];
+    [enc setBuffer:ctx->d_v_scales  offset:0 atIndex:3];
+    [enc setBuffer:ctx->d_k offset:0 atIndex:4];
+    [enc setBuffer:ctx->d_v offset:0 atIndex:5];
+    [enc setBytes:&kv_size length:sizeof(kv_size) atIndex:6];
+    [enc setBytes:&slot_u length:sizeof(slot_u) atIndex:7];
+    [enc setBytes:&n_kv_heads length:sizeof(n_kv_heads) atIndex:8];
+    [enc setThreadgroupMemoryLength:64 * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(n_kv_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
@@ -616,11 +626,13 @@ static void m_attention(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
     uint32_t n_splits = METAL_ATTN_SPLITS;
 
     /* --- Split pass: n_heads * n_splits threadgroups, head_dim threads each --- */
-    [enc setComputePipelineState:ctx->pipe_attention_split];
+    [enc setComputePipelineState:ctx->pipe_attention_split_q8];
     [enc setBuffer:ctx->d_attn_partials offset:0 atIndex:0];
     [enc setBuffer:q offset:0 atIndex:1];
-    [enc setBuffer:ctx->d_k_cache offset:0 atIndex:2];
-    [enc setBuffer:ctx->d_v_cache offset:0 atIndex:3];
+    [enc setBuffer:ctx->d_k_cache_q8 offset:0 atIndex:2];
+    [enc setBuffer:ctx->d_v_cache_q8 offset:0 atIndex:3];
+    [enc setBuffer:ctx->d_k_scales offset:0 atIndex:12];
+    [enc setBuffer:ctx->d_v_scales offset:0 atIndex:13];
     [enc setBytes:&n_heads length:sizeof(n_heads) atIndex:4];
     [enc setBytes:&n_kv_heads length:sizeof(n_kv_heads) atIndex:5];
     [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:6];
@@ -706,6 +718,7 @@ int hy3_metal_init(hy3_model *m) {
     ctx->pipe_rope            = hy3_make_pipeline(ctx->device, ctx->library, "rope");
     ctx->pipe_attention       = hy3_make_pipeline(ctx->device, ctx->library, "attention");
     ctx->pipe_attention_split = hy3_make_pipeline(ctx->device, ctx->library, "attention_split");
+    ctx->pipe_attention_split_q8 = hy3_make_pipeline(ctx->device, ctx->library, "attention_split_q8");
     ctx->pipe_attention_reduce= hy3_make_pipeline(ctx->device, ctx->library, "attention_reduce");
     ctx->pipe_matmul_f32      = hy3_make_pipeline(ctx->device, ctx->library, "matmul_f32");
     ctx->pipe_matmul_f16      = hy3_make_pipeline(ctx->device, ctx->library, "matmul_f16");
@@ -713,7 +726,7 @@ int hy3_metal_init(hy3_model *m) {
     ctx->pipe_matmul_q8_0_mm  = hy3_make_pipeline(ctx->device, ctx->library, "matmul_q8_0_mm");
     ctx->pipe_matmul_q4_k     = hy3_make_pipeline(ctx->device, ctx->library, "matmul_q4_k");
     ctx->pipe_matmul_q4_k_mm  = hy3_make_pipeline(ctx->device, ctx->library, "matmul_q4_k_mm");
-    ctx->pipe_kv_cache_write  = hy3_make_pipeline(ctx->device, ctx->library, "kv_cache_write");
+    ctx->pipe_kv_cache_write_q8 = hy3_make_pipeline(ctx->device, ctx->library, "kv_cache_write_q8");
     ctx->pipe_touch           = hy3_make_pipeline(ctx->device, ctx->library, "touch_u8_stride");
     ctx->pipe_router_topk     = hy3_make_pipeline(ctx->device, ctx->library, "router_topk");
     ctx->pipe_matmul_q4_k_id  = hy3_make_pipeline(ctx->device, ctx->library, "matmul_q4_k_id");
@@ -795,6 +808,18 @@ int hy3_metal_init(hy3_model *m) {
     ctx->ctx_cap_slots = default_ctx_tokens * HY3_N_LAYER;
     ctx->d_k_cache = hy3_alloc_half(ctx->device, (uint64_t)ctx->ctx_cap_slots * kv_dim);
     ctx->d_v_cache = hy3_alloc_half(ctx->device, (uint64_t)ctx->ctx_cap_slots * kv_dim);
+
+    /* Q8 KV cache (default on). Per-head absmax → int8 quantization. */
+    {
+        uint64_t kv_bytes = (uint64_t)ctx->ctx_cap_slots * kv_dim;
+        ctx->d_k_cache_q8 = [ctx->device newBufferWithLength:(NSUInteger)kv_bytes options:MTLResourceStorageModeShared];
+        ctx->d_v_cache_q8 = [ctx->device newBufferWithLength:(NSUInteger)kv_bytes options:MTLResourceStorageModeShared];
+        uint32_t n_scales = (uint32_t)ctx->ctx_cap_slots * HY3_N_KV_HEAD;
+        ctx->d_k_scales = hy3_alloc(ctx->device, n_scales);
+        ctx->d_v_scales = hy3_alloc(ctx->device, n_scales);
+        fprintf(stderr, "hy3_metal: Q8 KV cache enabled (default), %.2f GiB\n",
+                2.0 * (double)ctx->ctx_cap_slots * kv_dim * sizeof(uint8_t) / 1e9);
+    }
     fprintf(stderr, "hy3_metal: KV cache sized for %d tokens (%d layers x %d slots, %.2f GiB total, fp16)\n",
             default_ctx_tokens, HY3_N_LAYER, ctx->ctx_cap_slots,
             2.0 * ctx->ctx_cap_slots * kv_dim * sizeof(uint16_t) / 1e9);

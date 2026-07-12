@@ -295,7 +295,50 @@ kernel void kv_cache_write(device half        *k_cache  [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------
-// Online-softmax (flash-style) attention. Single pass over the KV cache:
+// Q8 KV cache write: per-head-channel absmax → int8 quantization.
+// One threadgroup per KV head, head_dim threads. Quantizes both K and V.
+// ---------------------------------------------------------------------
+kernel void kv_cache_write_q8(
+    device char        *k_q8   [[buffer(0)]],
+    device char        *v_q8   [[buffer(1)]],
+    device float       *k_sc   [[buffer(2)]],
+    device float       *v_sc   [[buffer(3)]],
+    device const float *k      [[buffer(4)]],
+    device const float *v      [[buffer(5)]],
+    constant uint      &kv_sz  [[buffer(6)]],
+    constant uint      &slot   [[buffer(7)]],
+    constant uint      &nkv    [[buffer(8)]],
+    threadgroup float  *red    [[threadgroup(0)]],
+    uint h    [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_grp  [[simdgroup_index_in_threadgroup]])
+{
+    if (h >= nkv) return;
+    uint hdim = kv_sz / nkv, ho = h * hdim;
+    float kv = (tid < hdim) ? k[ho + tid] : 0.0f;
+    float vv = (tid < hdim) ? v[ho + tid] : 0.0f;
+    float ak = fabs(kv), av = fabs(vv);
+    ak = simd_max(ak); av = simd_max(av);
+    if (simd_lane == 0) red[simd_grp] = ak;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gk = 0; for (uint i = 0; i < 128/32; i++) gk = fmax(gk, red[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane == 0) red[simd_grp] = av;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gv = 0; for (uint i = 0; i < 128/32; i++) gv = fmax(gv, red[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ks = (gk > 0) ? (gk / 127.0f) : (1.0f / 127.0f);
+    float vs = (gv > 0) ? (gv / 127.0f) : (1.0f / 127.0f);
+    if (tid == 0) { k_sc[slot * nkv + h] = ks; v_sc[slot * nkv + h] = vs; }
+    if (tid < hdim) {
+        k_q8[(size_t)slot * kv_sz + ho + tid] = (char)(int)clamp(round(kv/ks), -127.f, 127.f);
+        v_q8[(size_t)slot * kv_sz + ho + tid] = (char)(int)clamp(round(vv/vs), -127.f, 127.f);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Online-softmax attention. One threadgroup per head, head_dim threads.
 // each K and V vector is read exactly once, a running max `m` and
 // denominator `l` are maintained, and the value accumulator is rescaled
 // online. No materialized score array -> no context-length ceiling and
@@ -1017,6 +1060,73 @@ kernel void moe_combine_id(device float       *embed [[buffer(0)]], // M (+=)
     float acc = 0.0f;
     for (uint k = 0; k < K; k++) acc += wt[k] * down[(size_t)k * M + r];
     embed[r] += acc;
+}
+
+// ---------------------------------------------------------------------
+// Split-KV attention with Q8 KV cache. Same algorithm as attention_split
+// but loads K/V from int8 cache with per-head-channel dequantization.
+// ---------------------------------------------------------------------
+kernel void attention_split_q8(
+    device float       *partials   [[buffer(0)]],
+    device const float *q          [[buffer(1)]],
+    device const char  *k_q8       [[buffer(2)]],
+    device const char  *v_q8       [[buffer(3)]],
+    device const float *k_sc       [[buffer(12)]],
+    device const float *v_sc       [[buffer(13)]],
+    constant uint      &n_heads    [[buffer(4)]],
+    constant uint      &n_kv_heads [[buffer(5)]],
+    constant uint      &head_dim   [[buffer(6)]],
+    constant int       &kv_len     [[buffer(7)]],
+    constant uint      &kv_group   [[buffer(8)]],
+    constant int       &layer_id   [[buffer(9)]],
+    constant int       &n_layers   [[buffer(10)]],
+    constant uint      &n_splits   [[buffer(11)]],
+    threadgroup float  *red        [[threadgroup(0)]],
+    uint gid   [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]],
+    uint tgSz  [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_grp  [[simdgroup_index_in_threadgroup]])
+{
+    uint h = gid / n_splits, split = gid % n_splits;
+    if (h >= n_heads) return;
+    uint kv_h = h / kv_group;
+    int ntok = (kv_len - layer_id + n_layers) / n_layers;
+    if (ntok < 1) ntok = 1;
+    int chunk = (ntok + (int)n_splits - 1) / (int)n_splits;
+    int r0 = (int)split * chunk, r1 = r0 + chunk;
+    if (r1 > ntok) r1 = ntok;
+    device float *p = partials + (size_t)gid * (2 + head_dim);
+    if (r0 >= r1) {
+        if (tid == 0) { p[0] = -INFINITY; p[1] = 0.0f; }
+        for (uint i = tid; i < head_dim; i += tgSz) p[2+i] = 0.0f;
+        return;
+    }
+    device const float *q_h = q + (size_t)h * head_dim;
+    float qd = (tid < head_dim) ? q_h[tid] : 0.0f;
+    float scale = rsqrt(float(head_dim));
+    uint n_simd = tgSz / 32;
+    float m = -INFINITY, l = 0.0f, acc = 0.0f;
+    for (int t = r0; t < r1; t++) {
+        size_t base = (size_t)(t*n_layers+layer_id)*n_kv_heads*head_dim + (size_t)kv_h*head_dim;
+        size_t slot = (size_t)(t*n_layers+layer_id);
+        float ks = k_sc[slot * n_kv_heads + kv_h];
+        float vs = v_sc[slot * n_kv_heads + kv_h];
+        float part = (tid < head_dim) ? qd * ((float)k_q8[base+tid] * ks) : 0.0f;
+        part = simd_sum(part);
+        if (simd_lane == 0) red[simd_grp] = part;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float s = 0;
+        for (uint i = 0; i < n_simd; i++) s += red[i];
+        s *= scale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float m_new = max(m, s);
+        float corr = exp(m-m_new), prob = exp(s-m_new);
+        float vd = (tid < head_dim) ? ((float)v_q8[base+tid] * vs) : 0.0f;
+        l = l*corr+prob; acc = acc*corr+prob*vd; m = m_new;
+    }
+    if (tid == 0) { p[0] = m; p[1] = l; }
+    if (tid < head_dim) p[2+tid] = acc;
 }
 
 
