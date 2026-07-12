@@ -23,6 +23,10 @@ On a single **NVIDIA B300**: **~50 tok/s** end-to-end.
 
 On **M2 Ultra** (192 GB): **~22 tok/s**.
 
+GGUF:
+https://huggingface.co/cloudyu/hy3-gguf
+https://huggingface.co/autotrust/hy3-heretic-gguf (decensored / abliterated gguf)
+
 Full optimization history → [`docs/CUDA_OPTIMIZATION.md`](docs/CUDA_OPTIMIZATION.md)
 ([中文](docs/CUDA_OPTIMIZATION.zh.md)) and [`docs/METAL_OPTIMIZATION.md`](docs/METAL_OPTIMIZATION.md).
 
