@@ -1475,17 +1475,13 @@ int hy3_generate(hy3_model *m, const hy3_tokens *prompt,
     input.len = 0;
     input.cap = 0;
 
-    hy3_tokens_push(&input, prompt->v[0]);
+    /* Feed the entire prompt in one hy3_eval call so the GPU backend can batch
+     * it (chunked prefill via HY3_PREFILL_CHUNK). Multi-token evals run eager
+     * (no decode graph); CPU/partial paths loop per-token. Only the final
+     * token's logits are needed. */
+    (void)input;
     double t_prompt0 = now_sec();
-    hy3_eval(m, &input, logits, &pos);
-
-    for (int i = 1; i < prompt->len; i++) {
-        hy3_tokens single;
-        single.v = &prompt->v[i];
-        single.len = 1;
-        single.cap = 1;
-        hy3_eval(m, &single, logits, &pos);
-    }
+    hy3_eval(m, prompt, logits, &pos);
     double t_prompt = now_sec() - t_prompt0;
 
     int n_generated = 0;

@@ -345,6 +345,101 @@ __global__ void kv_quantize_int4_kernel(uint8_t*kc,uint8_t*vc,const float*k,cons
         vq[b]=(uint8_t)(qv0|(qv1<<4));
     }
 }
+/* ===== Chunked-prefill batched kernels =====================================
+ * Process a chunk of PF_QB..C query tokens together so the KV-cache read is
+ * amortised across the chunk (FlashInfer's operational-intensity argument:
+ * batching queries turns prefill attention from IO-bound O(1) toward
+ * compute-bound O(l_q)). Community basis: SARATHI (chunked prefill),
+ * FlashAttention-2 (fused online-softmax, no materialised scores). */
+#define PF_QB 16   /* query tile per attention block (register-bound) */
+
+/* Fill p[i]=base+i (per-token RoPE positions for a prefill chunk). Avoids the
+ * single-h_pos race: each token's position must persist in device memory for
+ * its async rope/kv-quantize kernels rather than sharing one pinned scalar. */
+__global__ void iota_kernel(int*p,int base,int n){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) p[i]=base+i; }
+/* Per-token RMSNorm over a [nq, n] batch: one block per token. */
+__global__ void rms_norm_batched_kernel(float*out,const float*x,const float*w,int n){
+    int t=blockIdx.x; const float*xt=x+(size_t)t*n; float*ot=out+(size_t)t*n;
+    extern __shared__ float sd[]; int tid=threadIdx.x; float sum=0.f;
+    for(int i=tid;i<n;i+=blockDim.x) sum+=xt[i]*xt[i]; sd[tid]=sum; __syncthreads();
+    for(int s=blockDim.x/2;s>0;s>>=1){ if(tid<s) sd[tid]+=sd[tid+s]; __syncthreads(); }
+    float r=rsqrtf(sd[0]/(float)n+1e-5f);
+    for(int i=tid;i<n;i+=blockDim.x) ot[i]=xt[i]*r*w[i];
+}
+/* Batched embedding lookup for nq tokens. */
+__global__ void embed_batch_kernel(float*out,const float*table,const int*toks,int nq,int dim){
+    int t=blockIdx.y; int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(t<nq && i<dim) out[(size_t)t*dim+i]=table[(size_t)toks[t]*dim+i];
+}
+/* FA2-style batched causal prefill attention, INT8 KV. grid=(nh, ceil(nq/PF_QB)),
+ * 1 warp/block. q read with stride qstride/token (queries live inside the fused
+ * QKV buffer); out written with stride ostride/token. base_tok = global token
+ * index of query 0 in this chunk; query i attends keys [0 .. base_tok+q0+i]. */
+__global__ void prefill_attn_int8_kernel(const float*q,float*out,const uint8_t*kc,const uint8_t*vc,
+    int nh,int hdim,int kvg,int il,int nl,int base_tok,int nq,int qstride,int ostride){
+    int h=blockIdx.x,qt=blockIdx.y,lane=threadIdx.x&31; int q0=qt*PF_QB; if(q0>=nq) return;
+    int nqi=(nq-q0<PF_QB)?(nq-q0):PF_QB; int kvh=h/kvg;
+    float4 qv[PF_QB]; float mm[PF_QB],ll[PF_QB]; float4 ov[PF_QB];
+    for(int i=0;i<PF_QB;i++){ mm[i]=-INFINITY; ll[i]=0.f; ov[i]=make_float4(0,0,0,0);
+        if(i<nqi){ const float*qh=q+(size_t)(q0+i)*qstride+(size_t)h*hdim; qv[i]=((const float4*)qh)[lane]; } }
+    float scale=rsqrtf((float)hdim); int maxkey=base_tok+q0+nqi-1;
+    for(int t=0;t<=maxkey;t++){
+        size_t bpos=(size_t)((size_t)t*nl+il)*KV_INT8_STRIDE;
+        float ks=__half2float(__ldg((const half*)(kc+bpos)+kvh));
+        float vs=__half2float(__ldg((const half*)(vc+bpos)+kvh));
+        const int8_t*kq=(const int8_t*)(kc+bpos+KV_INT8_QOFF)+(size_t)kvh*hdim;
+        const int8_t*vq=(const int8_t*)(vc+bpos+KV_INT8_QOFF)+(size_t)kvh*hdim;
+        uint32_t kp=__ldg((const uint32_t*)(kq+lane*4)),vp=__ldg((const uint32_t*)(vq+lane*4));
+        float4 k4,v4;
+        k4.x=(float)(int8_t)(kp&0xFF)*ks;k4.y=(float)(int8_t)((kp>>8)&0xFF)*ks;k4.z=(float)(int8_t)((kp>>16)&0xFF)*ks;k4.w=(float)(int8_t)((kp>>24)&0xFF)*ks;
+        v4.x=(float)(int8_t)(vp&0xFF)*vs;v4.y=(float)(int8_t)((vp>>8)&0xFF)*vs;v4.z=(float)(int8_t)((vp>>16)&0xFF)*vs;v4.w=(float)(int8_t)((vp>>24)&0xFF)*vs;
+        for(int i=0;i<nqi;i++){
+            if(t>base_tok+q0+i) continue;              /* causal */
+            float sc=qv[i].x*k4.x+qv[i].y*k4.y+qv[i].z*k4.z+qv[i].w*k4.w;
+            for(int o=16;o>0;o>>=1) sc+=__shfl_down_sync(0xffffffffu,sc,o);
+            sc=__shfl_sync(0xffffffffu,sc,0)*scale;
+            float nm=fmaxf(mm[i],sc),corr=__expf(mm[i]-nm),p=__expf(sc-nm);
+            ll[i]=ll[i]*corr+p; ov[i].x=ov[i].x*corr+v4.x*p; ov[i].y=ov[i].y*corr+v4.y*p; ov[i].z=ov[i].z*corr+v4.z*p; ov[i].w=ov[i].w*corr+v4.w*p; mm[i]=nm;
+        }
+    }
+    for(int i=0;i<nqi;i++){ float inv=ll[i]>0.f?1.f/ll[i]:0.f; float4 o=ov[i];
+        o.x*=inv;o.y*=inv;o.z*=inv;o.w*=inv;
+        float*oh=out+(size_t)(q0+i)*ostride+(size_t)h*hdim; ((float4*)oh)[lane]=o; }
+}
+/* INT4 KV variant (2 packed nibbles/byte). */
+__global__ void prefill_attn_int4_kernel(const float*q,float*out,const uint8_t*kc,const uint8_t*vc,
+    int nh,int hdim,int kvg,int il,int nl,int base_tok,int nq,int qstride,int ostride){
+    int h=blockIdx.x,qt=blockIdx.y,lane=threadIdx.x&31; int q0=qt*PF_QB; if(q0>=nq) return;
+    int nqi=(nq-q0<PF_QB)?(nq-q0):PF_QB; int kvh=h/kvg;
+    float4 qv[PF_QB]; float mm[PF_QB],ll[PF_QB]; float4 ov[PF_QB];
+    for(int i=0;i<PF_QB;i++){ mm[i]=-INFINITY; ll[i]=0.f; ov[i]=make_float4(0,0,0,0);
+        if(i<nqi){ const float*qh=q+(size_t)(q0+i)*qstride+(size_t)h*hdim; qv[i]=((const float4*)qh)[lane]; } }
+    float scale=rsqrtf((float)hdim); int maxkey=base_tok+q0+nqi-1;
+    for(int t=0;t<=maxkey;t++){
+        size_t bpos=(size_t)((size_t)t*nl+il)*KV_INT4_STRIDE;
+        float ks=__half2float(__ldg((const half*)(kc+bpos)+kvh));
+        float vs=__half2float(__ldg((const half*)(vc+bpos)+kvh));
+        const uint8_t*kq=(const uint8_t*)(kc+bpos+KV_INT8_QOFF)+(size_t)kvh*(hdim/2);
+        const uint8_t*vq=(const uint8_t*)(vc+bpos+KV_INT8_QOFF)+(size_t)kvh*(hdim/2);
+        unsigned kp=__ldg((const unsigned short*)(kq+lane*2)),vp=__ldg((const unsigned short*)(vq+lane*2));
+        float4 k4,v4; int n;
+        n=kp&0xF;if(n>7)n-=16;k4.x=(float)n*ks; n=(kp>>4)&0xF;if(n>7)n-=16;k4.y=(float)n*ks;
+        n=(kp>>8)&0xF;if(n>7)n-=16;k4.z=(float)n*ks; n=(kp>>12)&0xF;if(n>7)n-=16;k4.w=(float)n*ks;
+        n=vp&0xF;if(n>7)n-=16;v4.x=(float)n*vs; n=(vp>>4)&0xF;if(n>7)n-=16;v4.y=(float)n*vs;
+        n=(vp>>8)&0xF;if(n>7)n-=16;v4.z=(float)n*vs; n=(vp>>12)&0xF;if(n>7)n-=16;v4.w=(float)n*vs;
+        for(int i=0;i<nqi;i++){
+            if(t>base_tok+q0+i) continue;
+            float sc=qv[i].x*k4.x+qv[i].y*k4.y+qv[i].z*k4.z+qv[i].w*k4.w;
+            for(int o=16;o>0;o>>=1) sc+=__shfl_down_sync(0xffffffffu,sc,o);
+            sc=__shfl_sync(0xffffffffu,sc,0)*scale;
+            float nm=fmaxf(mm[i],sc),corr=__expf(mm[i]-nm),p=__expf(sc-nm);
+            ll[i]=ll[i]*corr+p; ov[i].x=ov[i].x*corr+v4.x*p; ov[i].y=ov[i].y*corr+v4.y*p; ov[i].z=ov[i].z*corr+v4.z*p; ov[i].w=ov[i].w*corr+v4.w*p; mm[i]=nm;
+        }
+    }
+    for(int i=0;i<nqi;i++){ float inv=ll[i]>0.f?1.f/ll[i]:0.f; float4 o=ov[i];
+        o.x*=inv;o.y*=inv;o.z*=inv;o.w*=inv;
+        float*oh=out+(size_t)(q0+i)*ostride+(size_t)h*hdim; ((float4*)oh)[lane]=o; }
+}
 __global__ void embed_lookup_kernel(float*out,const float*table,int token,int dim){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<dim) out[i]=table[(size_t)token*dim+i];
 }
@@ -392,6 +487,12 @@ typedef struct {
     int pos_stride;                 /* RoPE position multiplier (HY3_POS_STRIDE); 1 = normal.
                                        >1 spaces tokens across a large position range to probe
                                        long-context RoPE extrapolation cheaply. */
+    int pf_chunk;                   /* chunked-prefill chunk size (HY3_PREFILL_CHUNK); 0=off */
+    float *d_pf_x,*d_pf_s,*d_pf_qkv,*d_pf_ao,*d_pf_o; /* batched prefill activations */
+    half  *d_pf_xf16;               /* batched GEMM F16 input scratch */
+    int   *d_pf_tok;                /* chunk token ids (device) */
+    int   *d_pf_pos;                /* per-token RoPE positions (device) */
+    int    pf_cap;                  /* tokens currently allocated for prefill buffers */
 } gpu_ctx_t;
 
 /* ===== upload ===== */
@@ -490,6 +591,8 @@ int hy3_gpu_init(hy3_model *m,int n_gpu_layers){
     }
     { const char*e=getenv("HY3_KV_INT4"); ctx->kv_int4=(e&&atoi(e))?1:0; }
     ctx->kv_stride=ctx->kv_int4?KV_INT4_STRIDE:KV_INT8_STRIDE;
+    { const char*e=getenv("HY3_PREFILL_CHUNK"); ctx->pf_chunk=(e&&atoi(e)>0)?atoi(e):0;
+      if(ctx->pf_chunk>0) fprintf(stderr,"hy3_gpu: chunked prefill enabled (chunk=%d tokens)\n",ctx->pf_chunk); }
     { const char*e=getenv("HY3_POS_STRIDE"); ctx->pos_stride=(e&&atoi(e)>0)?atoi(e):1;
       if(ctx->pos_stride>1) fprintf(stderr,"hy3_gpu: RoPE position stride=%d (max pos ~%d for a prompt of N tokens: N*stride)\n",ctx->pos_stride,ctx->pos_stride); }
     int maxct=8192; size_t islots=(size_t)maxct*HY3_N_LAYER;
@@ -522,7 +625,7 @@ void hy3_gpu_free(hy3_model *m){
     #define GF(p) do{if(p){cudaFree(p);p=NULL;}}while(0)
     GF(ctx->d_token_embd);GF(ctx->d_output_norm);GF(ctx->d_output);
     for(int il=0;il<81;il++){GF(ctx->d_layer_attn_qkv[il]);GF(ctx->d_layer_attn_output[il]);GF(ctx->d_layer_attn_q_norm[il]);GF(ctx->d_layer_attn_k_norm[il]);GF(ctx->d_layer_attn_norm[il]);GF(ctx->d_layer_ffn_norm[il]);GF(ctx->d_layer_ffn_gate_inp[il]);GF(ctx->d_layer_ffn_down_shexp[il]);GF(ctx->d_layer_ffn_gateup_shexp[il]);GF(ctx->d_layer_eh_proj[il]);GF(ctx->d_layer_enorm[il]);GF(ctx->d_layer_hnorm[il]);GF(ctx->d_layer_final_norm[il]);GF(ctx->d_layer_expert_bias[il]);GF(ctx->d_gate_ptrs[il]);GF(ctx->d_up_ptrs[il]);GF(ctx->d_down_ptrs[il]);GF(ctx->d_layer_dense_ffn_gate[il]);GF(ctx->d_layer_dense_ffn_up[il]);GF(ctx->d_layer_dense_ffn_down[il]);for(int e=0;e<HY3_N_EXPERT;e++){GF(ctx->d_q4k_gate_exps[il][e].data);GF(ctx->d_q4k_up_exps[il][e].data);GF(ctx->d_q4k_down_exps[il][e].data);}}
-    GF(ctx->d_k_cache);GF(ctx->d_v_cache);GF(ctx->d_embed);GF(ctx->d_scratch);GF(ctx->d_scratch2);GF(ctx->d_attn_partials);GF(ctx->d_logits);GF(ctx->d_router_ids);GF(ctx->d_router_wts);GF(ctx->d_moe_gate_k);GF(ctx->d_moe_up_k);GF(ctx->d_moe_mid_k);GF(ctx->d_moe_down_k);GF(ctx->d_xf16);GF(ctx->d_rope_inv_freq);GF(ctx->d_pos);if(ctx->h_pos){cudaFreeHost(ctx->h_pos);ctx->h_pos=NULL;}if(ctx->graph_ready)cudaGraphExecDestroy(ctx->graph_exec);
+    GF(ctx->d_k_cache);GF(ctx->d_v_cache);GF(ctx->d_embed);GF(ctx->d_scratch);GF(ctx->d_scratch2);GF(ctx->d_attn_partials);GF(ctx->d_logits);GF(ctx->d_router_ids);GF(ctx->d_router_wts);GF(ctx->d_moe_gate_k);GF(ctx->d_moe_up_k);GF(ctx->d_moe_mid_k);GF(ctx->d_moe_down_k);GF(ctx->d_xf16);GF(ctx->d_rope_inv_freq);GF(ctx->d_pf_x);GF(ctx->d_pf_s);GF(ctx->d_pf_qkv);GF(ctx->d_pf_ao);GF(ctx->d_pf_o);GF(ctx->d_pf_xf16);GF(ctx->d_pf_tok);GF(ctx->d_pf_pos);GF(ctx->d_pos);if(ctx->h_pos){cudaFreeHost(ctx->h_pos);ctx->h_pos=NULL;}if(ctx->graph_ready)cudaGraphExecDestroy(ctx->graph_exec);
     if(ctx->ev_fork)cudaEventDestroy(ctx->ev_fork); if(ctx->ev_join)cudaEventDestroy(ctx->ev_join);
     if(ctx->stream2)cudaStreamDestroy(ctx->stream2);
     if(ctx->stream)cudaStreamDestroy(ctx->stream); if(ctx->cublas)cublasDestroy(ctx->cublas);
@@ -550,6 +653,32 @@ static void gpu_mul_mat_f32(gpu_ctx_t*ctx,const float*x,float*dst,const float*w,
 }
 static void gpu_rms_norm(gpu_ctx_t*ctx,float*o,const float*x,const float*w,int n){
     rms_norm_kernel<<<1,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(o,x,w,n);
+}
+/* Batched FP16 GEMM: dst[C x mm] = W[mm x n] . X[C x n]  (X,dst token-major).
+ * Same tensor-core path as gpu_mul_mat but with C columns instead of 1. */
+static void gpu_mul_mat_batched(gpu_ctx_t*ctx,const float*x,float*dst,const half*w,int mm,int n,int C){
+    f2h_vec_kernel<<<(C*n+255)/256,256,0,ctx->stream>>>(ctx->d_pf_xf16,x,C*n);
+    float a=1.f,b=0.f;
+    cublasGemmEx(ctx->cublas,CUBLAS_OP_T,CUBLAS_OP_N,mm,C,n,&a,
+                 w,CUDA_R_16F,n, ctx->d_pf_xf16,CUDA_R_16F,n, &b, dst,CUDA_R_32F,mm,
+                 CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
+}
+/* Allocate (once) the batched-prefill activation buffers for up to C tokens. */
+static void gpu_prefill_alloc(gpu_ctx_t*ctx,int C){
+    if(ctx->pf_cap>=C) return;
+    int qs=HY3_N_HEAD*HY3_HEAD_DIM,kvd=HY3_N_KV_HEAD*HY3_HEAD_DIM,W=qs+2*kvd;
+    #define PFREE(p) do{ if(p){cudaFree(p);(p)=NULL;} }while(0)
+    PFREE(ctx->d_pf_x);PFREE(ctx->d_pf_s);PFREE(ctx->d_pf_qkv);PFREE(ctx->d_pf_ao);PFREE(ctx->d_pf_o);
+    if(ctx->d_pf_xf16){cudaFree(ctx->d_pf_xf16);ctx->d_pf_xf16=NULL;} if(ctx->d_pf_tok){cudaFree(ctx->d_pf_tok);ctx->d_pf_tok=NULL;}
+    CUDA_CHECK(cudaMalloc(&ctx->d_pf_x,(size_t)C*HY3_N_EMBD*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_pf_s,(size_t)C*HY3_N_EMBD*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_pf_qkv,(size_t)C*W*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_pf_ao,(size_t)C*qs*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_pf_o,(size_t)C*HY3_N_EMBD*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_pf_xf16,(size_t)C*qs*sizeof(half)));  /* max GEMM input dim = qs */
+    CUDA_CHECK(cudaMalloc(&ctx->d_pf_tok,(size_t)C*sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_pf_pos,(size_t)C*sizeof(int)));
+    ctx->pf_cap=C;
 }
 static void gpu_ensure_kv_capacity(gpu_ctx_t*ctx,int ns){
     if(ns<=ctx->ctx_cap)return; size_t nc=(size_t)ns+(size_t)8192*HY3_N_LAYER;
@@ -663,6 +792,45 @@ static void gpu_decode_graph(gpu_ctx_t*ctx,hy3_model*m){
     CUDA_CHECK(cudaGraphLaunch(ctx->graph_exec,ctx->stream));
 }
 
+/* Chunked prefill: process nq prompt tokens together (full-GPU path only).
+ * Batches the always-active matmuls (QKV, O-proj) as GEMM and runs one
+ * FA2-style batched causal attention per layer (KV read amortised across the
+ * chunk). Per-token RoPE/KV-write and the routed-MoE FFN are looped (correct;
+ * further grouped-GEMM MoE batching is a later optimisation). Populates the KV
+ * cache for tokens [t0 .. t0+nq); does NOT compute logits (the final prompt
+ * token is handled by the normal per-token path, which sets d_embed). */
+static void prefill_chunk_gpu(gpu_ctx_t*ctx,hy3_model*m,const int*toks,int nq){
+    int qs=HY3_N_HEAD*HY3_HEAD_DIM,kvd=HY3_N_KV_HEAD*HY3_HEAD_DIM,W=qs+2*kvd,nl=HY3_N_LAYER;
+    int t0=m->cache_len/HY3_N_LAYER, kvg=HY3_N_HEAD/HY3_N_KV_HEAD;
+    gpu_ensure_kv_capacity(ctx,(t0+nq)*HY3_N_LAYER);
+    gpu_prefill_alloc(ctx,ctx->pf_chunk);
+    CUDA_CHECK(cudaMemcpyAsync(ctx->d_pf_tok,toks,nq*sizeof(int),cudaMemcpyHostToDevice,ctx->stream));
+    iota_kernel<<<(nq+255)/256,256,0,ctx->stream>>>(ctx->d_pf_pos,t0,nq);
+    embed_batch_kernel<<<dim3((HY3_N_EMBD+255)/256,nq),256,0,ctx->stream>>>(ctx->d_pf_x,ctx->d_token_embd,ctx->d_pf_tok,nq,HY3_N_EMBD);
+    float*s2=ctx->d_scratch,*aoS=ctx->d_scratch+2*HY3_DENSE_INTERMED;
+    for(int il=0;il<HY3_N_LAYER;il++){
+        rms_norm_batched_kernel<<<nq,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(ctx->d_pf_s,ctx->d_pf_x,ctx->d_layer_attn_norm[il],HY3_N_EMBD);
+        gpu_mul_mat_batched(ctx,ctx->d_pf_s,ctx->d_pf_qkv,ctx->d_layer_attn_qkv[il],W,HY3_N_EMBD,nq);
+        for(int c=0;c<nq;c++){
+            int*dpos=ctx->d_pf_pos+c;   /* persistent per-token position (no h_pos race) */
+            float*qc=ctx->d_pf_qkv+(size_t)c*W,*kc_=qc+qs,*vc_=qc+qs+kvd;
+            qk_norm_rope_fused_kernel<<<HY3_N_HEAD+HY3_N_KV_HEAD,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(qc,kc_,ctx->d_layer_attn_q_norm[il],ctx->d_layer_attn_k_norm[il],HY3_HEAD_DIM,HY3_N_HEAD,HY3_N_KV_HEAD,dpos,ctx->d_rope_inv_freq,ctx->rope_attn_factor,ctx->pos_stride);
+            if(ctx->kv_int4) kv_quantize_int4_kernel<<<HY3_N_KV_HEAD,32,0,ctx->stream>>>(ctx->d_k_cache,ctx->d_v_cache,kc_,vc_,dpos,il,nl);
+            else             kv_quantize_int8_kernel<<<HY3_N_KV_HEAD,32,0,ctx->stream>>>(ctx->d_k_cache,ctx->d_v_cache,kc_,vc_,dpos,il,nl);
+        }
+        dim3 g(HY3_N_HEAD,(nq+PF_QB-1)/PF_QB);
+        if(ctx->kv_int4) prefill_attn_int4_kernel<<<g,32,0,ctx->stream>>>(ctx->d_pf_qkv,ctx->d_pf_ao,ctx->d_k_cache,ctx->d_v_cache,HY3_N_HEAD,HY3_HEAD_DIM,kvg,il,nl,t0,nq,W,qs);
+        else             prefill_attn_int8_kernel<<<g,32,0,ctx->stream>>>(ctx->d_pf_qkv,ctx->d_pf_ao,ctx->d_k_cache,ctx->d_v_cache,HY3_N_HEAD,HY3_HEAD_DIM,kvg,il,nl,t0,nq,W,qs);
+        gpu_mul_mat_batched(ctx,ctx->d_pf_ao,ctx->d_pf_o,ctx->d_layer_attn_output[il],HY3_N_EMBD,qs,nq);
+        add_kernel<<<(nq*HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM,BLOCK_DIM,0,ctx->stream>>>(ctx->d_pf_x,ctx->d_pf_x,ctx->d_pf_o,nq*HY3_N_EMBD);
+        rms_norm_batched_kernel<<<nq,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(ctx->d_pf_s,ctx->d_pf_x,ctx->d_layer_ffn_norm[il],HY3_N_EMBD);
+        for(int c=0;c<nq;c++)
+            gpu_ffn_moe(ctx,m,il,ctx->d_pf_s+(size_t)c*HY3_N_EMBD,ctx->d_pf_x+(size_t)c*HY3_N_EMBD,aoS,s2);
+    }
+    m->cache_len=(t0+nq)*HY3_N_LAYER;
+    CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+}
+
 static double now_sec_cpu(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (double)ts.tv_sec+(double)ts.tv_nsec*1e-9; }
 int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
     gpu_ctx_t*ctx=(gpu_ctx_t*)m->gpu_ctx; if(!ctx)return -1;
@@ -673,7 +841,16 @@ int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
     static double tp_graph=0,tp_final=0,tp_dtoh=0; static long tp_n=0;
     double tpg0=0,tpg1=0,tpf0=0,tpf1=0,tpd0=0;
     int do_tp = getenv("HY3_TIMING")!=NULL;
-    for(int i=0;i<tokens->len;i++){
+    int i_start=0;
+    /* Chunked prefill (full-GPU): batch all prompt tokens but the last through
+     * prefill_chunk_gpu to populate the KV cache efficiently; the final token
+     * then runs the normal per-token path to produce logits. */
+    if(fg && ctx->pf_chunk>0 && tokens->len>1){
+        int npre=tokens->len-1,off=0;
+        while(off<npre){ int c=ctx->pf_chunk; if(c>npre-off)c=npre-off; prefill_chunk_gpu(ctx,m,tokens->v+off,c); off+=c; }
+        i_start=npre;
+    }
+    for(int i=i_start;i<tokens->len;i++){
         int token=tokens->v[i],cb=m->cache_len,tp=cb/HY3_N_LAYER;
         int grid=(HY3_N_EMBD+BLOCK_DIM-1)/BLOCK_DIM;
         embed_lookup_kernel<<<grid,BLOCK_DIM,0,ctx->stream>>>(ctx->d_embed,ctx->d_token_embd,token,HY3_N_EMBD);
@@ -683,11 +860,16 @@ int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
         if(do_tp){ tpg0=now_sec_cpu(); tpg1=tpg0; }
 
         if(fg){
-            /* Full-GPU: ensure KV capacity (host-side, may realloc), then
-             * warmup one token eagerly (so cuBLAS allocs its workspace before
-             * capture) and replay a CUDA graph thereafter. */
+            /* Full-GPU: ensure KV capacity (host-side, may realloc). The CUDA
+             * decode graph is a single-token latency optimization and is only
+             * safe/beneficial for len==1 (decode). Multi-token evals (prompt
+             * prefill fed in one call) run eager per token -- correct and
+             * compute-bound anyway; chunked prefill (above) accelerates that. */
             gpu_ensure_kv_capacity(ctx,cb+HY3_N_LAYER);
-            if(!ctx->graph_warmed){ for(int il=0;il<HY3_N_LAYER;il++) encode_layer_gpu(ctx,m,il); ctx->graph_warmed=1; }
+            if(tokens->len>1){
+                for(int il=0;il<HY3_N_LAYER;il++) encode_layer_gpu(ctx,m,il);
+                ctx->graph_warmed=1;
+            } else if(!ctx->graph_warmed){ for(int il=0;il<HY3_N_LAYER;il++) encode_layer_gpu(ctx,m,il); ctx->graph_warmed=1; }
             else gpu_decode_graph(ctx,m);
             if(do_tp){ cudaStreamSynchronize(ctx->stream); tpg1=now_sec_cpu(); }
             m->cache_len=cb+HY3_N_LAYER;
