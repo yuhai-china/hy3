@@ -63,6 +63,9 @@ def main():
     ap.add_argument("--depth", type=float, default=0.5)
     ap.add_argument("--yarn-factor", type=float, default=0.0)
     ap.add_argument("--kv-int4", action="store_true")
+    ap.add_argument("--pos-stride", type=int, default=1,
+                    help="RoPE position multiplier: spread N tokens across N*stride positions "
+                         "to probe long-context extrapolation without dense prefill")
     ap.add_argument("--needle", default="92183")
     ap.add_argument("--n-predict", type=int, default=16)
     args = ap.parse_args()
@@ -73,21 +76,35 @@ def main():
         env["HY3_ROPE_FACTOR"] = str(args.yarn_factor)
     if args.kv_int4:
         env["HY3_KV_INT4"] = "1"
+    if args.pos_stride and args.pos_stride > 1:
+        env["HY3_POS_STRIDE"] = str(args.pos_stride)
 
+    # Long prompts blow past the argv length limit, so feed via a --batch file
+    # (one prompt per line, real newlines escaped to \n; run_batch unescapes).
+    import tempfile
+    bf = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+    bf.write(prompt.replace("\\", "\\\\").replace("\n", "\\n") + "\n")
+    bf.close()
     cmd = [args.bin, "-m", args.model, "--gpu-layers", str(args.gpu_layers),
            "-t", str(args.threads), "-n", str(args.n_predict), "-temp", "0",
-           "-p", prompt]
+           "--batch", bf.name]
     t0 = time.time()
     p = subprocess.run(cmd, env=env, capture_output=True, text=True)
     dt = time.time() - t0
-    out, err = p.stdout, p.stderr
+    os.unlink(bf.name)
+    raw_out, err = p.stdout, p.stderr
+    # Extract the answer framed by <<<HY3_BEGIN 0>>> ... <<<HY3_END>>>
+    mm = re.search(r"<<<HY3_BEGIN \d+>>>\n?(.*?)\n?<<<HY3_END>>>", raw_out, re.S)
+    out = mm.group(1) if mm else raw_out
 
     m = re.search(r"prompt (\d+) tok", err)
     ptok = int(m.group(1)) if m else -1
     yarn = "YaRN RoPE enabled" in err
     kv = "INT4 KV" if "INT4 KV" in err else ("INT8 KV" if "INT8 KV" in err else "?")
     found = args.needle in out
-    print(f"[needle] req_tokens={args.tokens} actual_prompt_tok={ptok} depth={args.depth} "
+    maxpos = ptok * args.pos_stride if ptok > 0 else -1
+    print(f"[needle] req_tokens={args.tokens} actual_prompt_tok={ptok} stride={args.pos_stride} "
+          f"max_rope_pos~{maxpos} depth={args.depth} "
           f"yarn={'on' if yarn else 'off'}(factor={args.yarn_factor}) kv={kv} "
           f"wall={dt:.1f}s -> {'PASS' if found else 'FAIL'}")
     print(f"  model_output: {out.strip()[:200]!r}")

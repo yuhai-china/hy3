@@ -190,6 +190,7 @@ struct hy3_model {
     int   rope_yarn;
     int   rope_orig_ctx;
     float rope_factor;
+    int   rope_pos_stride;   /* HY3_POS_STRIDE: RoPE position multiplier (1=normal) */
 
     float *embed;
     float *cache_k;
