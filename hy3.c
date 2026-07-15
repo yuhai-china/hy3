@@ -558,6 +558,9 @@ void hy3_rope_init(hy3_model *m) {
     m->rope_factor = (float)factor;
     m->rope_pos_stride = 1;
     if ((e = getenv("HY3_POS_STRIDE"))) { int v = atoi(e); if (v > 0) m->rope_pos_stride = v; }
+    m->rope_pos_jump = 0; m->rope_pos_jump_at = 0;
+    if ((e = getenv("HY3_POS_JUMP")))    m->rope_pos_jump = atoi(e);
+    if ((e = getenv("HY3_POS_JUMP_AT"))) m->rope_pos_jump_at = atoi(e);
 
     if (getenv("HY3_ROPE_DUMP")) {
         fprintf(stderr, "HY3_ROPE_DUMP attn_factor=%.9g\n", (double)m->rope_attn_factor);
@@ -582,6 +585,7 @@ void hy3_rope_get_params(const hy3_model *m, float *inv_freq_out, float *attn_fa
 static void rope(hy3_model *m, float *q, float *k, int pos, int head_dim, int n_heads, int n_kv_heads) {
     const float *inv_freq = m->rope_inv_freq;
     float af = m->rope_attn_factor;
+    if (pos >= m->rope_pos_jump_at) pos += m->rope_pos_jump;  /* one-gap long-distance probe */
     pos *= m->rope_pos_stride;   /* strided-position probe: dense cache, spread RoPE positions */
     int half = head_dim / 2;
     for (int h = 0; h < n_heads; h++) {

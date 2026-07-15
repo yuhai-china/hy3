@@ -142,9 +142,14 @@ __global__ void silu_mul_kernel(float*out,const float*g,const float*u,int n){
 }
 /* fused Q/K norm + rope: one block per head (Q heads then K heads) */
 __global__ void qk_norm_rope_fused_kernel(float*q,float*k,const float*qw,const float*kw,
-    int hdim,int nh,int nkh,const int*d_pos,const float*inv_freq,float attn_factor,int pos_stride){
-    int pos=(*d_pos)*pos_stride;   /* pos_stride>1: RoPE positions span a large range
-                                      while the KV cache slot (=*d_pos) stays dense. */
+    int hdim,int nh,int nkh,const int*d_pos,const float*inv_freq,float attn_factor,int pos_stride,
+    int pos_jump,int pos_jump_at){
+    int ti=*d_pos;
+    /* pos_jump: token indices >= pos_jump_at get their RoPE position shifted by
+     * pos_jump (one big gap), so a short dense prompt can place its query >262144
+     * positions away from an early needle -- a cheap probe of long-distance RoPE
+     * extrapolation. The KV slot (=*d_pos) stays dense; only rope angle changes. */
+    int pos=(ti + (ti>=pos_jump_at ? pos_jump : 0))*pos_stride;
     int head=blockIdx.x,iskv=(head>=nh),h=iskv?(head-nh):head;
     float*buf=iskv?k:q,*x=buf+(size_t)h*hdim; const float*w=iskv?kw:qw;
     extern __shared__ float sd[]; int tid=threadIdx.x; float sum=0.f;
@@ -488,6 +493,7 @@ typedef struct {
                                        >1 spaces tokens across a large position range to probe
                                        long-context RoPE extrapolation cheaply. */
     int pf_chunk;                   /* chunked-prefill chunk size (HY3_PREFILL_CHUNK); 0=off */
+    int pos_jump, pos_jump_at;      /* HY3_POS_JUMP[_AT]: shift rope pos of tokens >=at by jump */
     float *d_pf_x,*d_pf_s,*d_pf_qkv,*d_pf_ao,*d_pf_o; /* batched prefill activations */
     half  *d_pf_xf16;               /* batched GEMM F16 input scratch */
     int   *d_pf_tok;                /* chunk token ids (device) */
@@ -593,6 +599,9 @@ int hy3_gpu_init(hy3_model *m,int n_gpu_layers){
     ctx->kv_stride=ctx->kv_int4?KV_INT4_STRIDE:KV_INT8_STRIDE;
     { const char*e=getenv("HY3_PREFILL_CHUNK"); ctx->pf_chunk=(e&&atoi(e)>0)?atoi(e):0;
       if(ctx->pf_chunk>0) fprintf(stderr,"hy3_gpu: chunked prefill enabled (chunk=%d tokens)\n",ctx->pf_chunk); }
+    { const char*e=getenv("HY3_POS_JUMP"); ctx->pos_jump=(e)?atoi(e):0;
+      const char*a=getenv("HY3_POS_JUMP_AT"); ctx->pos_jump_at=(a)?atoi(a):0;
+      if(ctx->pos_jump>0) fprintf(stderr,"hy3_gpu: RoPE pos jump=+%d for token idx>=%d\n",ctx->pos_jump,ctx->pos_jump_at); }
     { const char*e=getenv("HY3_POS_STRIDE"); ctx->pos_stride=(e&&atoi(e)>0)?atoi(e):1;
       if(ctx->pos_stride>1) fprintf(stderr,"hy3_gpu: RoPE position stride=%d (max pos ~%d for a prompt of N tokens: N*stride)\n",ctx->pos_stride,ctx->pos_stride); }
     int maxct=8192; size_t islots=(size_t)maxct*HY3_N_LAYER;
@@ -738,7 +747,7 @@ static void encode_layer_gpu(gpu_ctx_t*ctx,hy3_model*m,int il){
     gpu_rms_norm(ctx,s,x,ctx->d_layer_attn_norm[il],HY3_N_EMBD);
     float*qg=s2,*kg=s2+qs,*vg=s2+qs+kvd;
     gpu_mul_mat(ctx,s,s2,ctx->d_layer_attn_qkv[il],qs+2*kvd,HY3_N_EMBD);
-    qk_norm_rope_fused_kernel<<<HY3_N_HEAD+HY3_N_KV_HEAD,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(qg,kg,ctx->d_layer_attn_q_norm[il],ctx->d_layer_attn_k_norm[il],HY3_HEAD_DIM,HY3_N_HEAD,HY3_N_KV_HEAD,ctx->d_pos,ctx->d_rope_inv_freq,ctx->rope_attn_factor,ctx->pos_stride);
+    qk_norm_rope_fused_kernel<<<HY3_N_HEAD+HY3_N_KV_HEAD,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(qg,kg,ctx->d_layer_attn_q_norm[il],ctx->d_layer_attn_k_norm[il],HY3_HEAD_DIM,HY3_N_HEAD,HY3_N_KV_HEAD,ctx->d_pos,ctx->d_rope_inv_freq,ctx->rope_attn_factor,ctx->pos_stride,ctx->pos_jump,ctx->pos_jump_at);
     if(ctx->kv_int4){
         kv_quantize_int4_kernel<<<HY3_N_KV_HEAD,32,0,ctx->stream>>>(ctx->d_k_cache,ctx->d_v_cache,kg,vg,ctx->d_pos,il,HY3_N_LAYER);
         attention_split_kv_int4_kernel<<<HY3_N_HEAD*ctx->attn_splits,32,0,ctx->stream>>>(qg,ctx->d_k_cache,ctx->d_v_cache,HY3_N_HEAD,HY3_N_KV_HEAD,HY3_HEAD_DIM,ctx->d_pos,HY3_N_HEAD/HY3_N_KV_HEAD,il,HY3_N_LAYER,ctx->attn_splits,ctx->d_attn_partials);
@@ -814,7 +823,7 @@ static void prefill_chunk_gpu(gpu_ctx_t*ctx,hy3_model*m,const int*toks,int nq){
         for(int c=0;c<nq;c++){
             int*dpos=ctx->d_pf_pos+c;   /* persistent per-token position (no h_pos race) */
             float*qc=ctx->d_pf_qkv+(size_t)c*W,*kc_=qc+qs,*vc_=qc+qs+kvd;
-            qk_norm_rope_fused_kernel<<<HY3_N_HEAD+HY3_N_KV_HEAD,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(qc,kc_,ctx->d_layer_attn_q_norm[il],ctx->d_layer_attn_k_norm[il],HY3_HEAD_DIM,HY3_N_HEAD,HY3_N_KV_HEAD,dpos,ctx->d_rope_inv_freq,ctx->rope_attn_factor,ctx->pos_stride);
+            qk_norm_rope_fused_kernel<<<HY3_N_HEAD+HY3_N_KV_HEAD,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(qc,kc_,ctx->d_layer_attn_q_norm[il],ctx->d_layer_attn_k_norm[il],HY3_HEAD_DIM,HY3_N_HEAD,HY3_N_KV_HEAD,dpos,ctx->d_rope_inv_freq,ctx->rope_attn_factor,ctx->pos_stride,ctx->pos_jump,ctx->pos_jump_at);
             if(ctx->kv_int4) kv_quantize_int4_kernel<<<HY3_N_KV_HEAD,32,0,ctx->stream>>>(ctx->d_k_cache,ctx->d_v_cache,kc_,vc_,dpos,il,nl);
             else             kv_quantize_int8_kernel<<<HY3_N_KV_HEAD,32,0,ctx->stream>>>(ctx->d_k_cache,ctx->d_v_cache,kc_,vc_,dpos,il,nl);
         }
@@ -846,8 +855,13 @@ int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
      * prefill_chunk_gpu to populate the KV cache efficiently; the final token
      * then runs the normal per-token path to produce logits. */
     if(fg && ctx->pf_chunk>0 && tokens->len>1){
-        int npre=tokens->len-1,off=0;
-        while(off<npre){ int c=ctx->pf_chunk; if(c>npre-off)c=npre-off; prefill_chunk_gpu(ctx,m,tokens->v+off,c); off+=c; }
+        int npre=tokens->len-1,off=0; double pf_t0=now_sec_cpu(),pf_last=pf_t0;
+        while(off<npre){ int c=ctx->pf_chunk; if(c>npre-off)c=npre-off;
+            prefill_chunk_gpu(ctx,m,tokens->v+off,c); off+=c;
+            double now=now_sec_cpu(),dt=now-pf_last; pf_last=now;
+            fprintf(stderr,"hy3_gpu: prefill %d/%d tok (%.1f%%) | chunk %d in %.1fs (%.1f tok/s) | elapsed %.0fs\n",
+                    off,npre,100.0*off/npre,c,dt,c/(dt+1e-9),now-pf_t0);
+        }
         i_start=npre;
     }
     for(int i=i_start;i<tokens->len;i++){
@@ -889,7 +903,7 @@ int hy3_eval_gpu(hy3_model *m,const hy3_tokens *tokens,float *logits,int *pos){
             gpu_rms_norm(ctx,s,x,ctx->d_layer_attn_norm[il],HY3_N_EMBD);
             float*qg=s2,*kg=s2+qs,*vg=s2+qs+kvd;
             gpu_mul_mat(ctx,s,s2,ctx->d_layer_attn_qkv[il],qs+2*kvd,HY3_N_EMBD);
-            qk_norm_rope_fused_kernel<<<HY3_N_HEAD+HY3_N_KV_HEAD,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(qg,kg,ctx->d_layer_attn_q_norm[il],ctx->d_layer_attn_k_norm[il],HY3_HEAD_DIM,HY3_N_HEAD,HY3_N_KV_HEAD,ctx->d_pos,ctx->d_rope_inv_freq,ctx->rope_attn_factor,ctx->pos_stride);
+            qk_norm_rope_fused_kernel<<<HY3_N_HEAD+HY3_N_KV_HEAD,BLOCK_DIM,BLOCK_DIM*sizeof(float),ctx->stream>>>(qg,kg,ctx->d_layer_attn_q_norm[il],ctx->d_layer_attn_k_norm[il],HY3_HEAD_DIM,HY3_N_HEAD,HY3_N_KV_HEAD,ctx->d_pos,ctx->d_rope_inv_freq,ctx->rope_attn_factor,ctx->pos_stride,ctx->pos_jump,ctx->pos_jump_at);
             gpu_ensure_kv_capacity(ctx,kvl+1);
             int ns=gpu_optimal_splits(tp+1);
             if(ctx->kv_int4){

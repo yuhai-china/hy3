@@ -192,6 +192,7 @@ struct hy3_model {
     int   rope_orig_ctx;
     float rope_factor;
     int   rope_pos_stride;   /* HY3_POS_STRIDE: RoPE position multiplier (1=normal) */
+    int   rope_pos_jump, rope_pos_jump_at;  /* HY3_POS_JUMP[_AT]: one-gap position shift */
 
     float *embed;
     float *cache_k;
