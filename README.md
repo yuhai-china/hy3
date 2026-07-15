@@ -19,13 +19,16 @@ The project is called **hy3**.
 
 Supports **CPU**, **CUDA**, and **Metal**. All verified.
 
-**Context length: 262144 native, extensible to ~1M or beyond** via opt-in YaRN
-RoPE scaling + INT4 KV cache (`--rope-factor` / `HY3_KV_INT4`). The engine now
-*runs* ~1M-token contexts on a single 275 GB GPU (INT4 KV ≈ 81 GB @ 1M + 183 GB
-weights fits; positions and cache growth handled). The YaRN frequency math is
-verified bit-exact against `transformers`, and needle-retrieval passes in-range;
-note that **>262144 is extrapolation** past what the base model was trained on,
-so long-range quality there is not guaranteed. See
+**Context length: 262144 native. ~1M is CUDA-only.** Opt-in YaRN RoPE scaling
+works on all three backends (`--rope-factor` / `HY3_ROPE_*`), but reaching ~1M
+also needs the **INT4 KV cache, which is implemented on CUDA only**
+(`HY3_KV_INT4=1`): on CUDA the engine *runs* ~1M-token contexts on a single
+275 GB GPU (INT4 KV ≈ 81 GB @ 1M + 183 GB weights fits). CPU (FP32 KV ≈ 640 GB
+@ 1M) and Metal (FP16 KV ≈ 320 GB @ 1M) have no INT4 path, so 1M does **not**
+fit there — they remain practical only near the native context. The YaRN
+frequency math is verified bit-exact against `transformers` and needle-retrieval
+passes in-range; note that **>262144 is extrapolation** past what the base model
+was trained on, so long-range quality there is not guaranteed. See
 [Long context beyond 262144](#long-context-beyond-262144-yarn--int4-kv--experimental).
 
 On a single **NVIDIA B300**: **~50 tok/s** end-to-end.
