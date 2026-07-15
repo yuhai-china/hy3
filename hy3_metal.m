@@ -134,6 +134,7 @@ typedef struct {
     id<MTLBuffer> d_router_ids;  /* HY3_N_EXPERT_USED int32 expert ids */
     id<MTLBuffer> d_router_wts;  /* HY3_N_EXPERT_USED float combine weights */
     id<MTLBuffer> d_rope_inv_freq; /* HY3_HEAD_DIM/2 precomputed 1/theta^(2d/dim) */
+    float rope_attn_factor;        /* YaRN mscale, 1.0 when disabled */
     id<MTLBuffer> d_bias;        /* HY3_N_LAYER * HY3_N_EXPERT float expert bias (all layers, uploaded once) */
     id<MTLBuffer> d_gate_k;      /* HY3_N_EXPERT_USED * HY3_MOE_INTERMED */
     id<MTLBuffer> d_up_k;        /* HY3_N_EXPERT_USED * HY3_MOE_INTERMED */
@@ -473,6 +474,7 @@ static void m_rms_norm_heads_rope(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEnco
     [enc setBytes:&n_kv_heads length:sizeof(n_kv_heads) atIndex:6];
     [enc setBytes:&pos length:sizeof(pos) atIndex:7];
     [enc setBuffer:ctx->d_rope_inv_freq offset:0 atIndex:8];
+    [enc setBytes:&ctx->rope_attn_factor length:sizeof(float) atIndex:9];
     uint32_t grid = n_heads + n_kv_heads;
     [enc dispatchThreadgroups:MTLSizeMake(grid, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     if (!ctx->concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -594,6 +596,7 @@ static void m_rope(hy3_metal_ctx_t *ctx, id<MTLComputeCommandEncoder> enc,
     [enc setBytes:&n_heads length:sizeof(n_heads) atIndex:4];
     [enc setBytes:&n_kv_heads length:sizeof(n_kv_heads) atIndex:5];
     [enc setBuffer:ctx->d_rope_inv_freq offset:0 atIndex:6];
+    [enc setBytes:&ctx->rope_attn_factor length:sizeof(float) atIndex:7];
     uint32_t total = (n_heads + n_kv_heads) * (head_dim / 2);
     NSUInteger tg = 256;
     [enc dispatchThreadgroups:MTLSizeMake((total + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
@@ -769,17 +772,15 @@ int hy3_metal_init(hy3_model *m) {
     ctx->d_mid_k      = hy3_alloc(ctx->device, (uint64_t)HY3_N_EXPERT_USED * HY3_MOE_INTERMED);
     ctx->d_down_k     = hy3_alloc(ctx->device, (uint64_t)HY3_N_EXPERT_USED * HY3_N_EMBD);
 
-    /* Precompute RoPE inv_freq[d] = 1/theta^(2d/head_dim) once on the host. */
+    /* RoPE inv_freq[d] (YaRN-aware) + mscale, resolved once in hy3_rope_init()
+     * and shared with the CPU/CUDA backends via hy3_rope_get_params(). */
     {
         uint32_t half_dim = HY3_HEAD_DIM / 2;
-        float *inv = (float *)calloc(half_dim, sizeof(float));
-        const double theta = 11158840.0;
-        for (uint32_t d = 0; d < half_dim; d++)
-            inv[d] = (float)(1.0 / pow(theta, 2.0 * d / (double)HY3_HEAD_DIM));
+        float inv[HY3_HEAD_DIM / 2];
+        hy3_rope_get_params(m, inv, &ctx->rope_attn_factor);
         ctx->d_rope_inv_freq = [ctx->device newBufferWithBytes:inv
                                                         length:half_dim * sizeof(float)
                                                        options:MTLResourceStorageModeShared];
-        free(inv);
     }
 
     /* Upload every layer's expert bias once (static). Layers without a bias

@@ -115,6 +115,7 @@ kernel void rms_norm_heads_rope(device float       *q   [[buffer(0)]],
                                 constant uint      &n_kv_heads [[buffer(6)]],
                                 constant int       &pos       [[buffer(7)]],
                                 device const float *inv_freq  [[buffer(8)]],
+                                constant float     &attn_factor [[buffer(9)]],
                                 uint head [[threadgroup_position_in_grid]],
                                 uint tid  [[thread_index_in_threadgroup]],
                                 uint tgSz [[threads_per_threadgroup]])
@@ -143,7 +144,7 @@ kernel void rms_norm_heads_rope(device float       *q   [[buffer(0)]],
     uint half_dim = head_dim / 2;
     for (uint d = tid; d < half_dim; d += tgSz) {
         float freq = float(pos) * inv_freq[d];
-        float c = cos(freq), s = sin(freq);
+        float c = cos(freq) * attn_factor, s = sin(freq) * attn_factor;
         float v0 = x[d], v1 = x[d + half_dim];
         x[d]            = v0 * c - v1 * s;
         x[d + half_dim] = v1 * c + v0 * s;
@@ -250,6 +251,7 @@ kernel void rope(device float *q [[buffer(0)]],
                    constant uint &n_heads [[buffer(4)]],
                    constant uint &n_kv_heads [[buffer(5)]],
                    device const float *inv_freq [[buffer(6)]],
+                   constant float &attn_factor [[buffer(7)]],
                    uint idx [[thread_position_in_grid]])
 {
     uint half_dim = head_dim / 2;
@@ -267,7 +269,7 @@ kernel void rope(device float *q [[buffer(0)]],
     // inv_freq[d] = 1/pow(theta, 2d/head_dim) precomputed on the host, so a
     // multiply replaces a per-element pow()/exp() in this hot kernel.
     float freq = float(pos) * inv_freq[d];
-    float c = cos(freq), s = sin(freq);
+    float c = cos(freq) * attn_factor, s = sin(freq) * attn_factor;
     float v0 = base[d], v1 = base[d + half_dim];
     base[d]            = v0 * c - v1 * s;
     base[d + half_dim] = v1 * c + v0 * s;

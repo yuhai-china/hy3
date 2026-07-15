@@ -481,15 +481,112 @@ static void matmul_q8_0(float *dst, const block_q8_0 *w, const float *x, int m, 
  * which expands to the per-pair update below. Getting this pairing wrong
  * silently produces a different (wrong) rotation for every position except
  * position 0, corrupting attention for any sequence longer than one token. */
-static void rope(float *q, float *k, int pos, int head_dim, int n_heads, int n_kv_heads) {
-    float theta = HY3_ROPE_THETA;
+/* YaRN long-context RoPE scaling (Peng et al. 2023), matching the reference
+ * transformers _compute_yarn_parameters(). Only active when explicitly opted
+ * in (env HY3_ROPE_YARN / HY3_ROPE_FACTOR / HY3_CTX, or a rope-scaling block
+ * in the GGUF metadata). The model's published config.json is rope_type
+ * "default" with max_position_embeddings 262144, so this is an experimental
+ * extrapolation past the trained context, off by default. */
+static double yarn_correction_dim(double num_rot, int dim, double base, double max_pos) {
+    return ((double)dim * log(max_pos / (num_rot * 2.0 * M_PI))) / (2.0 * log(base));
+}
+
+static void yarn_correction_range(double beta_fast, double beta_slow, int dim,
+                                  double base, double max_pos, double *lo, double *hi) {
+    double low  = floor(yarn_correction_dim(beta_fast, dim, base, max_pos));
+    double high = ceil(yarn_correction_dim(beta_slow, dim, base, max_pos));
+    if (low < 0) low = 0;
+    if (high > dim - 1) high = dim - 1;
+    *lo = low;
+    *hi = high;
+}
+
+void hy3_rope_init(hy3_model *m) {
+    const int half = HY3_HEAD_DIM / 2;
+
+    double base = (double)HY3_ROPE_THETA;
+    { uint32_t fb = get_u32(&m->gguf, "hy_v3.rope.freq_base", 0);
+      if (fb) base = (double)fb; }
+
+    double orig = (double)get_u32(&m->gguf, "hy_v3.context_length", 262144);
+    double factor = 1.0, beta_fast = 32.0, beta_slow = 1.0, attn_factor = 1.0;
+    int yarn = 0;
+    const char *e;
+
+    /* Optional rope-scaling block baked into the GGUF (not present in the
+     * stock converter output, but honored if a future converter writes it). */
+    { uint32_t t = get_u32(&m->gguf, "hy_v3.rope.scaling.original_context_length", 0);
+      if (t) orig = (double)t; }
+    { float f = get_f32(&m->gguf, "hy_v3.rope.scaling.factor", 0.0f);
+      if (f > 1.0f) { factor = f; yarn = 1; } }
+
+    /* Runtime overrides (opt-in). */
+    if ((e = getenv("HY3_ROPE_ORIG_CTX"))) { double v = atof(e); if (v > 0) orig = v; }
+    if ((e = getenv("HY3_ROPE_FACTOR")))   { double v = atof(e); if (v > 1.0) { factor = v; yarn = 1; } }
+    if ((e = getenv("HY3_CTX"))) {
+        double tgt = atof(e);
+        if (tgt > orig) { double f = tgt / orig; if (f > factor) factor = f; yarn = 1; }
+    }
+    if ((e = getenv("HY3_ROPE_YARN"))) { if (atoi(e)) yarn = 1; else yarn = 0; }
+    if ((e = getenv("HY3_ROPE_BETA_FAST"))) beta_fast = atof(e);
+    if ((e = getenv("HY3_ROPE_BETA_SLOW"))) beta_slow = atof(e);
+
+    if (yarn && factor > 1.0) attn_factor = 0.1 * log(factor) + 1.0;
+    if ((e = getenv("HY3_ROPE_ATTN_FACTOR"))) attn_factor = atof(e);
+    if (!(yarn && factor > 1.0)) { yarn = 0; attn_factor = 1.0; factor = 1.0; }
+
+    double lo = 0, hi = 0;
+    if (yarn) yarn_correction_range(beta_fast, beta_slow, HY3_HEAD_DIM, base, orig, &lo, &hi);
+    double denom = hi - lo; if (denom < 1e-3) denom = 1e-3;
+
+    for (int i = 0; i < half; i++) {
+        double pos_freq   = pow(base, (double)(2 * i) / (double)HY3_HEAD_DIM);
+        double inv_extrap = 1.0 / pos_freq;
+        double invf = inv_extrap;
+        if (yarn) {
+            double inv_interp = 1.0 / (factor * pos_freq);
+            double ramp = ((double)i - lo) / denom;
+            if (ramp < 0) ramp = 0; if (ramp > 1) ramp = 1;
+            double extrap_w = 1.0 - ramp;                 /* keep high-freq dims extrapolated */
+            invf = inv_interp * (1.0 - extrap_w) + inv_extrap * extrap_w;
+        }
+        m->rope_inv_freq[i] = (float)invf;
+    }
+    m->rope_attn_factor = (float)attn_factor;
+    m->rope_yarn = yarn;
+    m->rope_orig_ctx = (int)orig;
+    m->rope_factor = (float)factor;
+
+    if (getenv("HY3_ROPE_DUMP")) {
+        fprintf(stderr, "HY3_ROPE_DUMP attn_factor=%.9g\n", (double)m->rope_attn_factor);
+        for (int i = 0; i < half; i++)
+            fprintf(stderr, "HY3_ROPE_DUMP inv_freq[%d]=%.9g\n", i, (double)m->rope_inv_freq[i]);
+    }
+
+    if (yarn) {
+        fprintf(stderr,
+                "hy3: YaRN RoPE enabled | base=%.0f orig_ctx=%d factor=%.3f "
+                "-> ctx~%d | attn_factor=%.4f beta=(%.0f,%.0f)\n",
+                base, (int)orig, factor, (int)(orig * factor), attn_factor,
+                beta_fast, beta_slow);
+    }
+}
+
+void hy3_rope_get_params(const hy3_model *m, float *inv_freq_out, float *attn_factor_out) {
+    if (inv_freq_out) memcpy(inv_freq_out, m->rope_inv_freq, sizeof(m->rope_inv_freq));
+    if (attn_factor_out) *attn_factor_out = m->rope_attn_factor;
+}
+
+static void rope(hy3_model *m, float *q, float *k, int pos, int head_dim, int n_heads, int n_kv_heads) {
+    const float *inv_freq = m->rope_inv_freq;
+    float af = m->rope_attn_factor;
     int half = head_dim / 2;
     for (int h = 0; h < n_heads; h++) {
         float *q_h = q + (size_t)h * head_dim;
         for (int d = 0; d < half; d++) {
-            float freq = (float)pos / powf(theta, (float)(2 * d) / (float)head_dim);
-            float cos_val = cosf(freq);
-            float sin_val = sinf(freq);
+            float freq = (float)pos * inv_freq[d];
+            float cos_val = cosf(freq) * af;
+            float sin_val = sinf(freq) * af;
             float q0 = q_h[d];
             float q1 = q_h[d + half];
             q_h[d]        = q0 * cos_val - q1 * sin_val;
@@ -499,9 +596,9 @@ static void rope(float *q, float *k, int pos, int head_dim, int n_heads, int n_k
     for (int h = 0; h < n_kv_heads; h++) {
         float *k_h = k + (size_t)h * head_dim;
         for (int d = 0; d < half; d++) {
-            float freq = (float)pos / powf(theta, (float)(2 * d) / (float)head_dim);
-            float cos_val = cosf(freq);
-            float sin_val = sinf(freq);
+            float freq = (float)pos * inv_freq[d];
+            float cos_val = cosf(freq) * af;
+            float sin_val = sinf(freq) * af;
             float k0 = k_h[d];
             float k1 = k_h[d + half];
             k_h[d]        = k0 * cos_val - k1 * sin_val;
@@ -795,6 +892,7 @@ int hy3_model_load(hy3_model **out, const char *path, int n_threads) {
     }
 
     m->ctx_size = HY3_N_VOCAB;
+    hy3_rope_init(m);
     m->embed = xcalloc(HY3_N_EMBD, sizeof(float));
     m->scratch = xcalloc(HY3_DENSE_INTERMED * 2 + HY3_N_EMBD * 4 + HY3_N_HEAD * HY3_HEAD_DIM * 4, sizeof(float));
     m->scratch2 = xcalloc(HY3_N_EXPERT + HY3_MOE_INTERMED * 4 + HY3_N_EMBD * 2, sizeof(float));
@@ -1065,7 +1163,7 @@ void forward_layer_dense(hy3_model *m, int il, int pos) {
             rms_norm(k + h * HY3_HEAD_DIM, k + h * HY3_HEAD_DIM, wn, HY3_HEAD_DIM, HY3_RMS_EPS);
     }
 
-    rope(q, k, pos, HY3_HEAD_DIM, HY3_N_HEAD, HY3_N_KV_HEAD);
+    rope(m, q, k, pos, HY3_HEAD_DIM, HY3_N_HEAD, HY3_N_KV_HEAD);
 
     int kv_len = m->cache_len;
     float *k_cache = m->cache_k + (size_t)kv_len * kv_size;
@@ -1123,7 +1221,7 @@ void forward_layer_moe(hy3_model *m, int il, int pos) {
             rms_norm(k + h * HY3_HEAD_DIM, k + h * HY3_HEAD_DIM, wn, HY3_HEAD_DIM, HY3_RMS_EPS);
     }
 
-    rope(q, k, pos, HY3_HEAD_DIM, HY3_N_HEAD, HY3_N_KV_HEAD);
+    rope(m, q, k, pos, HY3_HEAD_DIM, HY3_N_HEAD, HY3_N_KV_HEAD);
 
     int kv_len = m->cache_len;
     float *k_cache = m->cache_k + (size_t)kv_len * kv_size;

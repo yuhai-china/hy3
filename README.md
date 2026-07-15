@@ -19,6 +19,15 @@ The project is called **hy3**.
 
 Supports **CPU**, **CUDA**, and **Metal**. All verified.
 
+**Context length: 262144 native, extensible to ~1M or beyond** via opt-in YaRN
+RoPE scaling + INT4 KV cache (`--rope-factor` / `HY3_KV_INT4`). The engine now
+*runs* ~1M-token contexts on a single 275 GB GPU (INT4 KV ≈ 81 GB @ 1M + 183 GB
+weights fits; positions and cache growth handled). The YaRN frequency math is
+verified bit-exact against `transformers`, and needle-retrieval passes in-range;
+note that **>262144 is extrapolation** past what the base model was trained on,
+so long-range quality there is not guaranteed. See
+[Long context beyond 262144](#long-context-beyond-262144-yarn--int4-kv--experimental).
+
 On a single **NVIDIA B300**: **~50 tok/s** end-to-end.
 
 On **M2 Ultra** (192 GB): **~22 tok/s**.
@@ -218,6 +227,52 @@ plus a KV cache (default 8192 tokens ≈ 5.4GB, `HY3_METAL_CTX_TOKENS` env var
 to change) plus small scratch buffers. On a 192GB Mac with the 173.78GB
 mixed-precision GGUF this leaves headroom, but it's not huge — close other
 memory-heavy applications.
+
+## Long context beyond 262144 (YaRN + INT4 KV) — experimental
+
+The published `tencent/Hy3` config is `max_position_embeddings: 262144` with
+`rope_parameters.rope_type: "default"` — i.e. **no** RoPE scaling was trained
+in. The engine reproduces that native rope exactly by default. Two opt-in
+features let you push past the native context (e.g. toward ~1M):
+
+- **YaRN RoPE scaling** (`--rope-yarn`, `--rope-factor <f>`, `--rope-ctx <n>`,
+  or env `HY3_ROPE_FACTOR` / `HY3_CTX` / `HY3_ROPE_ORIG_CTX` /
+  `HY3_ROPE_BETA_FAST` / `HY3_ROPE_BETA_SLOW` / `HY3_ROPE_ATTN_FACTOR`). This is
+  the standard YaRN interpolation (Peng et al. 2023); the per-dim `inv_freq`
+  table and mscale match `transformers`' `_compute_yarn_parameters` to float32
+  precision (verified). Applied identically on CPU, CUDA, and Metal. **Off by
+  default** — the default table is bit-for-bit the native rope.
+
+  ```bash
+  # ~1M target context (factor 4 over the native 262144)
+  ./hy3-cli -m hy3.gguf --gpu-layers 80 --rope-factor 4 -p "..." -n 64
+  ```
+
+- **INT4 KV cache** (`HY3_KV_INT4=1`, CUDA only): 4 bits/element (528 B/slot
+  vs INT8's 1040), halving KV footprint. This is what lets a full-model 1M-token
+  context fit in a single B300's VRAM: INT8 KV at 1M ≈ 162 GB + 183 GB weights
+  > 275 GB, whereas INT4 ≈ 81 GB + 183 GB fits. Same decode speed as INT8
+  (~56 tok/s measured).
+
+  ```bash
+  HY3_KV_INT4=1 ./hy3-cli -m hy3.gguf --gpu-layers 80 --rope-factor 4 -p "..." -n 64
+  ```
+
+> **This is extrapolation, not a supported context length.** Because the base
+> model was never trained (or validated) above 262144, YaRN keeps output
+> *coherent* past that point but cannot guarantee long-range retrieval quality.
+> Validate for your use case with the needle harness before relying on it:
+>
+> ```bash
+> python3 eval/hy3_needle.py --model hy3.gguf --gpu-layers 80 \
+>     --tokens 300000 --depth 0.5 --yarn-factor 4 --kv-int4
+> ```
+>
+> Measured so far (single B300): needle retrieval **passes** at 16727 tokens for
+> YaRN-off, YaRN-factor-4, and YaRN-factor-4 + INT4-KV (depth 0.9). Prefill runs
+> ~33 tok/s at 16k and grows with context, so a genuine >262144-token run takes
+> hours of prefill — run it on your own hardware/time budget with the command
+> above.
 
 ## Testing
 

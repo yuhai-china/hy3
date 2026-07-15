@@ -71,6 +71,9 @@ void hy3_tokens_push(hy3_tokens *tv, int token);
 void hy3_tokens_unshift(hy3_tokens *tv, int token);
 void hy3_tokens_free(hy3_tokens *tv);
 
+void hy3_rope_init(hy3_model *m);
+void hy3_rope_get_params(const hy3_model *m, float *inv_freq_out, float *attn_factor_out);
+
 int hy3_eval(hy3_model *m, const hy3_tokens *tokens, float *logits, int *pos);
 int hy3_eval_gpu(hy3_model *m, const hy3_tokens *tokens, float *logits, int *pos);
 int hy3_eval_metal(hy3_model *m, const hy3_tokens *tokens, float *logits, int *pos);
@@ -174,6 +177,19 @@ struct hy3_model {
     double t_load;
     int ctx_size;
     int n_expert_used;   /* runtime top-k for MoE routing; default HY3_N_EXPERT_USED, clamped to [1, HY3_N_EXPERT_USED] */
+
+    /* RoPE frequency table + YaRN long-context extrapolation.
+     * rope_inv_freq[d] = 1/theta^(2d/head_dim) for the default rope_type, or
+     * the YaRN-interpolated per-dim frequency when long-context scaling is
+     * enabled. rope_attn_factor is YaRN's mscale (1.0 when disabled). Resolved
+     * once in hy3_rope_init() and shared with the CUDA/Metal backends via
+     * hy3_rope_get_params(). Default (no env/metadata scaling) reproduces the
+     * model's native rope exactly. */
+    float rope_inv_freq[HY3_HEAD_DIM / 2];
+    float rope_attn_factor;
+    int   rope_yarn;
+    int   rope_orig_ctx;
+    float rope_factor;
 
     float *embed;
     float *cache_k;

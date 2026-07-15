@@ -125,6 +125,10 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --batch <f>   Batch mode: run every prompt line in file <f> (model loads once).\n");
     fprintf(stderr, "                Each line is one prompt with \\n escaped; blank lines skipped.\n");
     fprintf(stderr, "                Output is framed by <<<HY3_BEGIN i>>> ... <<<HY3_END>>> markers.\n");
+    fprintf(stderr, "  --rope-yarn   Enable YaRN RoPE scaling for context beyond the native 262144\n");
+    fprintf(stderr, "                (EXPERIMENTAL extrapolation; the base model is rope_type default).\n");
+    fprintf(stderr, "  --rope-factor <f> YaRN scale factor (e.g. 4 -> ~1M ctx). Implies --rope-yarn.\n");
+    fprintf(stderr, "  --rope-ctx <n>    Target context length; derives the YaRN factor. Implies --rope-yarn.\n");
 #ifdef HY3_CUDA
     fprintf(stderr, "  --gpu         Use GPU acceleration (CUDA)\n");
     fprintf(stderr, "  --gpu-layers <n>  Number of layers to offload to CUDA GPU\n");
@@ -179,6 +183,12 @@ int main(int argc, char **argv) {
             think = 1;
         } else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
             batch_file = argv[++i];
+        } else if (strcmp(argv[i], "--rope-yarn") == 0) {
+            setenv("HY3_ROPE_YARN", "1", 1);
+        } else if (strcmp(argv[i], "--rope-factor") == 0 && i + 1 < argc) {
+            setenv("HY3_ROPE_FACTOR", argv[++i], 1);
+        } else if (strcmp(argv[i], "--rope-ctx") == 0 && i + 1 < argc) {
+            setenv("HY3_CTX", argv[++i], 1);
 #ifdef HY3_CUDA
         } else if (strcmp(argv[i], "--gpu") == 0) {
             params.use_gpu = 1;
