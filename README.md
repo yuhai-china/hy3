@@ -234,6 +234,19 @@ to change) plus small scratch buffers. On a 192GB Mac with the 173.78GB
 mixed-precision GGUF this leaves headroom, but it's not huge — close other
 memory-heavy applications.
 
+> **⚠️ macOS `iogpu.wired_limit_mb` (silent all-zero failure).** Metal can only
+> read GPU-wired memory; pages beyond the wired limit are read back as **all
+> zeros with no error**, so if the model + KV cache exceed it you get correct-
+> looking startup logs but **garbage output** (repeated `!`, and a bogus
+> ~1000 tok/s because the zeroed compute degenerates). The default wired limit
+> is ~75% of RAM (e.g. ~144 GB on a 192 GB Mac), which is **below** the
+> 173.78 GB GGUF + KV cache (~178 GB). Raise it before running:
+> ```bash
+> sudo sysctl iogpu.wired_limit_mb=192000   # >= model + KV; ~192 GB here
+> ```
+> (Set it in `/etc/sysctl.conf` to persist across reboots. Leave a few GB of
+> headroom for the OS.)
+
 ## Long context beyond 262144 (YaRN + INT4 KV) — experimental
 
 The published `tencent/Hy3` config is `max_position_embeddings: 262144` with
