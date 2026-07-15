@@ -31,7 +31,19 @@ passes in-range; note that **>262144 is extrapolation** past what the base model
 was trained on, so long-range quality there is not guaranteed. See
 [Long context beyond 262144](#long-context-beyond-262144-yarn--int4-kv--experimental).
 
-On a single **NVIDIA B300**: **~50 tok/s** end-to-end.
+On a single **NVIDIA B300**: **~50 tok/s** end-to-end (decode), **~58 tok/s**
+prefill with chunked prefill (`HY3_PREFILL_CHUNK`).
+
+**Quality:** 11/13 (85%) on the `eval/hy3_eval.py` reasoning/coding benchmark
+(CUDA, 80 layers, experts 8, think off, temp 1.0) — unchanged by the
+long-context/serving features below, which are all off by default.
+
+**Serving features (CUDA):**
+- **Chunked prefill** (`HY3_PREFILL_CHUNK=N`) — batched-GEMM + FlashAttention-2-style
+  batched attention; ~1.9× faster prefill at 8k, more at longer contexts.
+- **Prefix caching** (multi-turn, `--convo`) — reuse the KV cache across turns,
+  prefilling only each turn's new tokens (per-turn prefill 72 → 249+ tok/s).
+- **INT4 KV cache** (`HY3_KV_INT4=1`) + **YaRN** (`--rope-factor`) for long context.
 
 On **M2 Ultra** (192 GB): **~22 tok/s**.
 
