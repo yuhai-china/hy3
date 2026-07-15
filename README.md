@@ -261,6 +261,31 @@ features let you push past the native context (e.g. toward ~1M):
   HY3_KV_INT4=1 ./hy3-cli -m hy3.gguf --gpu-layers 80 --rope-factor 4 -p "..." -n 64
   ```
 
+### Chunked prefill (`HY3_PREFILL_CHUNK`, CUDA) — faster long prompts
+
+Long-context prompts are **prefill-bound** (ingesting the prompt dominates; the
+answer is short). The default path processes prompt tokens one at a time, which
+underutilizes the GPU. `HY3_PREFILL_CHUNK=<N>` (e.g. 512) processes the prompt
+in chunks of N tokens on the full-GPU path, applying community techniques:
+
+- **Chunked prefill** (SARATHI) — fixed-size token chunks that saturate compute.
+- **Batched matmuls** — QKV / O-projection run as M=C cuBLAS GEMM instead of C
+  separate GEMVs.
+- **Batched causal attention** (FlashAttention-2 / FlashInfer style) — one fused
+  online-softmax kernel per layer with a query tile, so the KV-cache read is
+  amortized across the chunk (turns IO-bound prefill attention toward
+  compute-bound). Works with INT8 and INT4 KV (dequant on the fly).
+
+Measured (single B300, 8k-token needle prompt): prefill **30.7 → 58.4 tok/s
+(~1.9×)** with identical output; the gain grows with context length since the
+batched attention term dominates more as the prompt grows. Off by default;
+greedy output is bit-identical to the per-token path. (Routed-expert MoE is
+still per-token — a grouped-GEMM MoE would further cut the linear term.)
+
+```bash
+HY3_PREFILL_CHUNK=512 ./hy3-cli -m hy3.gguf --gpu-layers 80 -p "<long prompt>" -n 64
+```
+
 > **This is extrapolation, not a supported context length.** Because the base
 > model was never trained (or validated) above 262144, YaRN keeps output
 > *coherent* past that point but cannot guarantee long-range retrieval quality.
