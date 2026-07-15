@@ -330,11 +330,19 @@ the entire history is reused rather than re-prefilled each turn.
 >     --tokens 300000 --depth 0.5 --yarn-factor 4 --kv-int4
 > ```
 >
-> Measured so far (single B300): needle retrieval **passes** at 16727 tokens for
-> YaRN-off, YaRN-factor-4, and YaRN-factor-4 + INT4-KV (depth 0.9). Prefill runs
-> ~33 tok/s at 16k and grows with context, so a genuine >262144-token run takes
-> hours of prefill — run it on your own hardware/time budget with the command
-> above.
+> Measured so far (single B300):
+> - **In-range dense** needle retrieval **passes** at 16727 / 34392 tokens for
+>   YaRN-off, YaRN-factor-4, and YaRN-factor-4 + INT4-KV.
+> - **Long-distance RoPE probe** (`HY3_POS_JUMP`): since RoPE is relative, the
+>   extrapolation question is about the query↔needle *distance*, which a single
+>   position jump reproduces cheaply (short dense prompt, one OOD gap, local
+>   structure in-distribution). Result: at **~320k** distance both raw and YaRN
+>   retrieve (the base theta 11.16M already extrapolates that far for a sparse
+>   lookup); at **~1M** distance **raw RoPE fails but YaRN factor 4 retrieves
+>   correctly** — the on/off control isolates YaRN as the cause. This verifies
+>   the YaRN *rope-extrapolation mechanism* holds to 1M distance.
+> - A genuine **dense** >262144-token run is memory-fitted by INT4 KV but is
+>   ~O(n²) prefill-bound (~hours) on one GPU — see chunked prefill below.
 
 ## Testing
 
