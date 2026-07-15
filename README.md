@@ -286,6 +286,28 @@ still per-token — a grouped-GEMM MoE would further cut the linear term.)
 HY3_PREFILL_CHUNK=512 ./hy3-cli -m hy3.gguf --gpu-layers 80 -p "<long prompt>" -n 64
 ```
 
+### Prefix caching (multi-turn) — reuse KV across turns
+
+Multi-turn chat repeatedly prefills a growing conversation. Prefix caching keeps
+the KV cache resident and, on each turn, reuses the longest token prefix that
+matches the previous turn — so only the **new** tokens are prefilled instead of
+re-processing the whole history.
+
+`--convo <file>` runs one user turn per line as a single growing conversation
+(KV persists across turns). It composes with chunked prefill (the new-suffix
+prefill uses `HY3_PREFILL_CHUNK`). Always correct — only exact-match token
+prefixes are reused; disable with `HY3_NO_PREFIX_CACHE=1`.
+
+```bash
+./hy3-cli -m hy3.gguf --gpu-layers 80 --convo turns.txt -n 128
+```
+
+Measured (single B300, 3-turn convo): turn 2 reused 64/80 prompt tokens
+(prefill **72 → 249 tok/s**), turn 3 reused 81/96 (**→ 318 tok/s**); the model
+correctly recalls facts from earlier turns, and `HY3_NO_PREFIX_CACHE=1` yields
+identical answers (pure speedup). The saving grows with conversation length —
+the entire history is reused rather than re-prefilled each turn.
+
 > **This is extrapolation, not a supported context length.** Because the base
 > model was never trained (or validated) above 262144, YaRN keeps output
 > *coherent* past that point but cannot guarantee long-range retrieval quality.
