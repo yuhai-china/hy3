@@ -940,6 +940,7 @@ void hy3_model_free(hy3_model *m) {
     free(m->scratch2);
     free(m->cache_k);
     free(m->cache_v);
+    free(m->cache_tokens);
     free(m);
 }
 
@@ -952,7 +953,24 @@ void hy3_set_gpu_ctx(hy3_model *m, void *ctx) { m->gpu_ctx = ctx; }
  * so zeroing it is sufficient for both the CPU and Metal paths -- old slots are
  * simply overwritten from the start. Used by batch mode to reuse one loaded
  * model across many independent prompts. */
-void hy3_reset_context(hy3_model *m) { m->cache_len = 0; }
+void hy3_reset_context(hy3_model *m) { m->cache_len = 0; m->cache_ntok = 0; }
+
+/* Prefix-cache token bookkeeping (see struct hy3_model). */
+static void cache_tokens_set(hy3_model *m, const int *toks, int n) {
+    if (n > m->cache_tok_cap) {
+        m->cache_tok_cap = n + 512;
+        m->cache_tokens = xrealloc(m->cache_tokens, (size_t)m->cache_tok_cap * sizeof(int));
+    }
+    if (n > 0) memcpy(m->cache_tokens, toks, (size_t)n * sizeof(int));
+    m->cache_ntok = n;
+}
+static void cache_tokens_push(hy3_model *m, int tok) {
+    if (m->cache_ntok >= m->cache_tok_cap) {
+        m->cache_tok_cap = m->cache_ntok + 512;
+        m->cache_tokens = xrealloc(m->cache_tokens, (size_t)m->cache_tok_cap * sizeof(int));
+    }
+    m->cache_tokens[m->cache_ntok++] = tok;
+}
 
 int hy3_model_vocab_size(hy3_model *m) { return HY3_N_VOCAB; }
 const char *hy3_model_name(hy3_model *m) { return "HYV3ForCausalLM"; }
@@ -1475,14 +1493,35 @@ int hy3_generate(hy3_model *m, const hy3_tokens *prompt,
     input.len = 0;
     input.cap = 0;
 
-    /* Feed the entire prompt in one hy3_eval call so the GPU backend can batch
-     * it (chunked prefill via HY3_PREFILL_CHUNK). Multi-token evals run eager
-     * (no decode graph); CPU/partial paths loop per-token. Only the final
-     * token's logits are needed. */
+    /* Prefix caching: reuse the longest common prefix of this prompt with the
+     * tokens already resident in the KV cache (from a previous turn). Roll the
+     * cache back to that prefix and prefill only the divergent suffix. The
+     * device/CPU KV for slots [0,P) is untouched and thus reused directly.
+     * Always correct (only exactly-matching token prefixes are reused); inert
+     * after hy3_reset_context() (batch mode) since cache_ntok is 0. */
     (void)input;
+    int P = 0;
+    if (!getenv("HY3_NO_PREFIX_CACHE")) {
+        int maxP = prompt->len < m->cache_ntok ? prompt->len : m->cache_ntok;
+        while (P < maxP && prompt->v[P] == m->cache_tokens[P]) P++;
+    }
+    if (P >= prompt->len) P = prompt->len - 1;  /* always eval >=1 token to get logits */
+    if (P < 0) P = 0;
+    m->cache_len = P * HY3_N_LAYER;             /* roll back; slots [0,P) reused */
+
     double t_prompt0 = now_sec();
-    hy3_eval(m, prompt, logits, &pos);
+    {
+        hy3_tokens suffix;
+        suffix.v = (int *)prompt->v + P;
+        suffix.len = prompt->len - P;
+        suffix.cap = suffix.len;
+        hy3_eval(m, &suffix, logits, &pos);
+    }
     double t_prompt = now_sec() - t_prompt0;
+    cache_tokens_set(m, prompt->v, prompt->len);
+    if (P > 0)
+        fprintf(stderr, "hy3: prefix cache reused %d/%d prompt tokens (prefilled %d)\n",
+                P, prompt->len, prompt->len - P);
 
     int n_generated = 0;
     double t_gen0 = now_sec();
@@ -1508,6 +1547,7 @@ int hy3_generate(hy3_model *m, const hy3_tokens *prompt,
         single.cap = 1;
         double te0 = now_sec();
         hy3_eval(m, &single, logits, &pos);
+        cache_tokens_push(m, token);   /* keep prefix cache in sync for next turn */
         t_eval_acc += now_sec() - te0;
         n_generated++;
     }
@@ -1796,6 +1836,28 @@ void hy3_tokenize_chat(hy3_model *m, const char *user_text, int think, hy3_token
     hy3_tokens_push(out, HY3_TOK_ASSISTANT);
     hy3_tokens_push(out, HY3_TOK_THINK_BEGIN);
     if (think == 0) hy3_tokens_push(out, HY3_TOK_THINK_END);
+}
+
+/* Append one user turn to a running multi-turn conversation `conv`, so the KV
+ * cache built for previous turns can be reused via prefix caching. The first
+ * turn emits the BOS + reasoning-mode header; later turns only append a fresh
+ * USER ... ASSISTANT block after whatever the model already generated (its
+ * prior assistant tokens, including the stop marker, are already in conv). */
+void hy3_chat_append_user(hy3_model *m, hy3_tokens *conv, const char *user_text,
+                          int think, int is_first) {
+    const char *effort = (think >= 2) ? "reasoning_effort:high"
+                       : (think == 1) ? "reasoning_effort:low"
+                                      : "reasoning_effort:no_think";
+    if (is_first) {
+        hy3_tokens_push(conv, HY3_TOK_BOS);
+        hy3_tokens_push(conv, HY3_TOK_REASONING_MODE);
+        hy3_tokenize(m, effort, conv);
+    }
+    hy3_tokens_push(conv, HY3_TOK_USER);
+    hy3_tokenize(m, user_text, conv);
+    hy3_tokens_push(conv, HY3_TOK_ASSISTANT);
+    hy3_tokens_push(conv, HY3_TOK_THINK_BEGIN);
+    if (think == 0) hy3_tokens_push(conv, HY3_TOK_THINK_END);
 }
 
 

@@ -106,6 +106,47 @@ static int run_batch(hy3_model *model, const char *path, int n_predict,
     return 0;
 }
 
+/* Multi-turn conversation: emit callback that both prints the token and
+ * appends it to the running conversation token buffer, so the next turn's
+ * prompt = [full prior conversation + generated] and prefix caching reuses it. */
+typedef struct { hy3_model *model; hy3_tokens *conv; } convo_emit_ctx;
+static int convo_emit_token(void *ud, int token) {
+    convo_emit_ctx *c = (convo_emit_ctx *)ud;
+    hy3_tokens_push(c->conv, token);   /* keep conv in lockstep with the KV cache */
+    return emit_token(c->model, token);
+}
+
+/* --convo: read one user turn per line from `path` and run them as a single
+ * growing conversation (KV cache persists across turns; only each turn's new
+ * tokens are prefilled thanks to prefix caching). */
+static int run_convo(hy3_model *model, const char *path, int n_predict,
+                     hy3_params *params, int think) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "hy3: cannot open convo file '%s'\n", path); return 1; }
+    hy3_reset_context(model);
+    hy3_tokens conv; memset(&conv, 0, sizeof(conv));
+    char line[1 << 16];
+    int turn = 0;
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
+        if (len == 0) continue;
+        unescape_inplace(line);
+        hy3_chat_append_user(model, &conv, line, think, turn == 0);
+        printf("\n>>> turn %d: %s\n", turn, line);
+        fflush(stdout);
+        convo_emit_ctx ec = { model, &conv };
+        hy3_generate(model, &conv, n_predict, params, convo_emit_token, &ec);
+        printf("\n");
+        fflush(stdout);
+        turn++;
+    }
+    hy3_tokens_free(&conv);
+    fclose(f);
+    fprintf(stderr, "hy3: convo complete, %d turn(s)\n", turn);
+    return 0;
+}
+
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options] -m <model.gguf> [prompt]\n", prog);
     fprintf(stderr, "\nOptions:\n");
@@ -125,6 +166,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --batch <f>   Batch mode: run every prompt line in file <f> (model loads once).\n");
     fprintf(stderr, "                Each line is one prompt with \\n escaped; blank lines skipped.\n");
     fprintf(stderr, "                Output is framed by <<<HY3_BEGIN i>>> ... <<<HY3_END>>> markers.\n");
+    fprintf(stderr, "  --convo <f>   Multi-turn: each line in <f> is one user turn of a single\n");
+    fprintf(stderr, "                growing conversation; KV cache persists across turns and only\n");
+    fprintf(stderr, "                each turn's new tokens are prefilled (prefix caching).\n");
     fprintf(stderr, "  --rope-yarn   Enable YaRN RoPE scaling for context beyond the native 262144\n");
     fprintf(stderr, "                (EXPERIMENTAL extrapolation; the base model is rope_type default).\n");
     fprintf(stderr, "  --rope-factor <f> YaRN scale factor (e.g. 4 -> ~1M ctx). Implies --rope-yarn.\n");
@@ -157,6 +201,7 @@ int main(int argc, char **argv) {
     int raw_prompt = 0;  /* 0 = apply chat template, 1 = feed raw text */
     int think = 0;       /* reasoning block: 0 = no_think, 1 = low, 2 = high */
     const char *batch_file = NULL;
+    const char *convo_file = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -183,6 +228,8 @@ int main(int argc, char **argv) {
             think = 1;
         } else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
             batch_file = argv[++i];
+        } else if (strcmp(argv[i], "--convo") == 0 && i + 1 < argc) {
+            convo_file = argv[++i];
         } else if (strcmp(argv[i], "--rope-yarn") == 0) {
             setenv("HY3_ROPE_YARN", "1", 1);
         } else if (strcmp(argv[i], "--rope-factor") == 0 && i + 1 < argc) {
@@ -251,6 +298,12 @@ int main(int argc, char **argv) {
 
     if (batch_file) {
         int rc = run_batch(model, batch_file, n_predict, &params, raw_prompt, think);
+        hy3_model_free(model);
+        return rc;
+    }
+
+    if (convo_file) {
+        int rc = run_convo(model, convo_file, n_predict, &params, think);
         hy3_model_free(model);
         return rc;
     }

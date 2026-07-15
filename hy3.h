@@ -63,6 +63,7 @@ int hy3_model_ctx_size(hy3_model *m);
 
 void hy3_tokenize(hy3_model *m, const char *text, hy3_tokens *out);
 void hy3_tokenize_chat(hy3_model *m, const char *user_text, int think, hy3_tokens *out);
+void hy3_chat_append_user(hy3_model *m, hy3_tokens *conv, const char *user_text, int think, int is_first);
 int hy3_detokenize(hy3_model *m, int token, char *buf, size_t cap);
 int hy3_token_eos(hy3_model *m);
 int hy3_token_bos(hy3_model *m);
@@ -196,6 +197,14 @@ struct hy3_model {
     float *cache_k;
     float *cache_v;
     int cache_len;
+
+    /* Prefix caching (multi-turn): token ids whose KV is currently resident, in
+     * order. cache_ntok == cache_len / HY3_N_LAYER. On each generate() the
+     * longest common prefix with the new prompt is reused (cache rolled back to
+     * it) so only the divergent suffix is prefilled. */
+    int *cache_tokens;
+    int  cache_ntok;
+    int  cache_tok_cap;
 
     float *scratch;
     float *scratch2;
