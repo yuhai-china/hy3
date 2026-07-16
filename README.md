@@ -242,7 +242,7 @@ memory-heavy applications.
 > is ~75% of RAM (e.g. ~144 GB on a 192 GB Mac), which is **below** the
 > 173.78 GB GGUF + KV cache (~178 GB). Raise it before running:
 > ```bash
-> sudo sysctl iogpu.wired_limit_mb=192000   # >= model + KV; ~192 GB here
+> sudo sysctl iogpu.wired_limit_mb=184000   # >= model + KV; ~192 GB here
 > ```
 > (Set it in `/etc/sysctl.conf` to persist across reboots. Leave a few GB of
 > headroom for the OS.)
